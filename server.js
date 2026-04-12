@@ -70,6 +70,8 @@ app.get('/api/search', async (req, res) => {
     const results = raw.split('\n').filter(Boolean).map(line => {
       try {
         const d = JSON.parse(line);
+        // ✅ Filtrar: solo videos (tienen duration y ID corto de 11 chars)
+        if (!d.id || d.id.length !== 11 || !d.duration) return null;
         return {
           id: d.id,
           title: d.title,
