@@ -9,7 +9,6 @@ const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 const COOKIES_SOURCE = '/etc/secrets/cookies.txt';
 const COOKIES_FILE = path.join(__dirname, 'yt-cookies.txt');
 
-// Instancias públicas de Invidious (reemplazo de Piped que cerró)
 const INVIDIOUS = [
   'https://inv.nadeko.net',
   'https://invidious.fdn.fr',
@@ -96,7 +95,7 @@ async function invAudioUrl(videoId) {
   return streams[0].url;
 }
 
-// ─── yt-dlp fallback ──────────────────────────────────────────────────────────
+// ─── yt-dlp ───────────────────────────────────────────────────────────────────
 function ytdlp(args) {
   const cookieFlag = fs.existsSync(COOKIES_FILE) ? `--cookies "${COOKIES_FILE}"` : '';
   const flags = `${cookieFlag} --extractor-args "youtube:player_client=ios,web" --no-warnings --no-check-certificates`;
@@ -128,9 +127,8 @@ async function ytdlpAudioUrl(videoId) {
   return url;
 }
 
-// ─── getAudioUrl con rotación de instancias ────────────────────────────────
+// ─── getAudioUrl con rotación de instancias ───────────────────────────────────
 async function getAudioUrl(videoId) {
-  // Probar todas las instancias de Invidious antes de caer a yt-dlp
   for (let i = 0; i < INVIDIOUS.length; i++) {
     try {
       return await invAudioUrl(videoId);
@@ -150,7 +148,6 @@ app.get('/', (_req, res) =>
 app.get('/api/search', async (req, res) => {
   const { q, limit = 15 } = req.query;
   if (!q) return res.status(400).json({ error: 'Falta q' });
-  // Intentar Invidious con rotación
   for (let i = 0; i < INVIDIOUS.length; i++) {
     try {
       const results = await invSearch(q, Number(limit));
@@ -160,7 +157,6 @@ app.get('/api/search', async (req, res) => {
       invIdx++;
     }
   }
-  // Fallback yt-dlp
   try {
     const results = await ytdlpSearch(q, Number(limit));
     return res.json({ results, source: 'ytdlp' });
@@ -170,14 +166,11 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-app.get('/api/url/:videoId', async (req, res) => {
-  try {
-    const url = await getAudioUrl(req.params.videoId);
-    res.json({ url });
-  } catch (err) {
-    console.error('URL error:', err);
-    res.json({ url: null, fallback: true });
-  }
+// Returns the absolute stream URL — raw YT CDN URLs are IP-locked and fail
+// when used directly as audio.src in the browser.
+app.get('/api/url/:videoId', (req, res) => {
+  const base = `${req.protocol}://${req.get('host')}`;
+  res.json({ url: `${base}/api/stream/${req.params.videoId}`, fallback: false });
 });
 
 app.get('/api/stream/:videoId', async (req, res) => {
@@ -209,7 +202,6 @@ app.post('/api/download', async (req, res) => {
   const filepath = path.join(DOWNLOADS_DIR, filename);
   if (fs.existsSync(filepath))
     return res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
-  // Invidious + ffmpeg
   try {
     const audioUrl = await invAudioUrl(videoId);
     await new Promise((resolve, reject) => {
@@ -223,7 +215,6 @@ app.post('/api/download', async (req, res) => {
     });
     return res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
   } catch (e) { console.warn('[Download] Invidious+ffmpeg falló:', e.message); }
-  // yt-dlp fallback
   try {
     await ytdlp(`"https://www.youtube.com/watch?v=${videoId}" -x --audio-format mp3 --audio-quality 0 -o "${filepath}"`);
     res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
