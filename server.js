@@ -1,6 +1,21 @@
-// Agregar al inicio, antes de todo
+const { execSync } = require('child_process');
+const fs = require('fs');
+
+// Auto-instalar yt-dlp si no está
+if (!fs.existsSync('/usr/local/bin/yt-dlp')) {
+  console.log('Instalando yt-dlp...');
+  try {
+    execSync('curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp', { stdio: 'inherit' });
+    execSync('chmod a+rx /usr/local/bin/yt-dlp', { stdio: 'inherit' });
+    console.log('yt-dlp instalado:', execSync('yt-dlp --version').toString().trim());
+  } catch(e) {
+    console.error('Error instalando yt-dlp:', e.message);
+  }
+}
+
 const ffmpegPath = require('ffmpeg-static');
-process.env.PATH = `${require('path').dirname(ffmpegPath)}:${process.env.PATH}`;
+process.env.PATH = `/usr/local/bin:${require('path').dirname(ffmpegPath)}:${process.env.PATH}`;
+
 const express = require('express');
 const cors = require('cors');
 const { exec, spawn } = require('child_process');
