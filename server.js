@@ -8,17 +8,21 @@ const cors = require('cors');
 const { spawn } = require('child_process');
 
 // ─── Auto-instalar yt-dlp ────────────────────────────────────────────────────
+// ─── Auto-instalar / actualizar yt-dlp ─────────────────────────────────────
 const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 
-if (!fs.existsSync(YTDLP_PATH)) {
-  console.log('Instalando yt-dlp...');
-  try {
+try {
+  if (!fs.existsSync(YTDLP_PATH)) {
+    console.log('Instalando yt-dlp...');
     execSync(`curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${YTDLP_PATH}"`, { stdio: 'inherit' });
-    execSync(`chmod a+rx "${YTDLP_PATH}"`, { stdio: 'inherit' });
-    console.log('yt-dlp listo:', execSync(`"${YTDLP_PATH}" --version`).toString().trim());
-  } catch(e) {
-    console.error('Error instalando yt-dlp:', e.message);
+  } else {
+    console.log('Actualizando yt-dlp...');
+    execSync(`"${YTDLP_PATH}" -U`, { stdio: 'inherit' }); // ← actualiza siempre
   }
+  execSync(`chmod a+rx "${YTDLP_PATH}"`, { stdio: 'inherit' });
+  console.log('yt-dlp:', execSync(`"${YTDLP_PATH}" --version`).toString().trim());
+} catch(e) {
+  console.error('Error con yt-dlp:', e.message);
 }
 
 const ffmpegBin = require('ffmpeg-static');
