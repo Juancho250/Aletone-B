@@ -42,39 +42,61 @@ function fmt(s) {
 function sanitize(n) {
   return (n || 'track').replace(/[^a-z0-9\-_. ]/gi, '_').substring(0, 100);
 }
-async function fetchJSON(url, timeoutMs = 12000, extraHeaders = {}) {
+
+// fetchJSON con múltiples User-Agents para evitar bloqueos
+const UA_LIST = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+];
+let uaIdx = 0;
+
+async function fetchJSON(url, timeoutMs = 15000, extraHeaders = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const ua = UA_LIST[uaIdx++ % UA_LIST.length];
   try {
     const r = await fetch(url, {
       signal: ctrl.signal,
-      headers: { 'User-Agent': 'Mozilla/5.0', ...extraHeaders },
+      headers: { 'User-Agent': ua, 'Accept': 'application/json', ...extraHeaders },
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   } finally { clearTimeout(t); }
 }
 
-// ─── JioSaavn ─────────────────────────────────────────────────────────────────
+// ─── JioSaavn — múltiples endpoints de fallback ───────────────────────────────
+const JSV_APIS = [
+  'https://saavn.dev',
+  'https://jiosaavn-api-privatecvc2.vercel.app',
+];
+
 async function jiosaavnSearch(q, limit = 15) {
-  const queries = [q, q.split(' ').slice(0, 2).join(' ')];
-  for (const query of queries) {
-    try {
-      const data = await fetchJSON(
-        `https://saavn.dev/api/search/songs?query=${encodeURIComponent(query)}&page=1&limit=${limit}`
-      );
-      const results = (data?.data?.results || []).map(s => ({
-        id: `jsv_${s.id}`,
-        title: s.name || '',
-        artist: (s.artists?.primary || []).map(a => a.name).join(', ') || '',
-        duration: s.duration || 0,
-        durationStr: fmt(s.duration),
-        thumbnail: s.image?.[2]?.url || s.image?.[1]?.url || '',
-        source: 'jiosaavn',
-      })).filter(s => s.id);
-      if (results.length > 0) return results;
-    } catch (e) {
-      console.warn('[JioSaavn search]', e.message);
+  for (const base of JSV_APIS) {
+    // intenta query completo y simplificado
+    const queries = [q, q.split(' ').slice(0, 2).join(' ')];
+    for (const query of queries) {
+      try {
+        const data = await fetchJSON(
+          `${base}/api/search/songs?query=${encodeURIComponent(query)}&page=1&limit=${limit}`,
+          12000
+        );
+        const results = (data?.data?.results || []).map(s => ({
+          id: `jsv_${s.id}`,
+          title: s.name || '',
+          artist: (s.artists?.primary || []).map(a => a.name).join(', ') || '',
+          duration: s.duration || 0,
+          durationStr: fmt(s.duration),
+          thumbnail: s.image?.[2]?.url || s.image?.[1]?.url || '',
+          source: 'jiosaavn',
+        })).filter(s => s.id && s.title);
+        if (results.length > 0) {
+          console.log(`[JioSaavn search] ok via ${base} para "${query}"`);
+          return results;
+        }
+      } catch (e) {
+        console.warn(`[JioSaavn search] ${base}:`, e.message);
+      }
     }
   }
   return [];
@@ -82,15 +104,51 @@ async function jiosaavnSearch(q, limit = 15) {
 
 async function jiosaavnStreamUrl(trackId) {
   const realId = trackId.replace('jsv_', '');
-  const data = await fetchJSON(`https://saavn.dev/api/songs/${realId}`);
-  const song = data?.data?.[0];
-  const urls = song?.downloadUrl || [];
-  const url = [...urls].reverse().find(u => u?.url)?.url;
-  if (!url) throw new Error('JioSaavn: no stream URL');
-  return url;
+  for (const base of JSV_APIS) {
+    try {
+      const data = await fetchJSON(`${base}/api/songs/${realId}`, 12000);
+      const song = data?.data?.[0];
+      const urls = song?.downloadUrl || [];
+      const url = [...urls].reverse().find(u => u?.url)?.url;
+      if (url) return url;
+    } catch (e) {
+      console.warn(`[JioSaavn stream] ${base}:`, e.message);
+    }
+  }
+  throw new Error('JioSaavn: no stream URL en ningún endpoint');
 }
 
-// ─── YouTube search via multiple Invidious instances ─────────────────────────
+// ─── YouTube search via yt-dlp (solo búsqueda, no stream) ────────────────────
+async function ytdlpSearch(q, limit = 15) {
+  const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
+  const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
+  try {
+    const raw = await new Promise((resolve, reject) => {
+      exec(
+        `"${YTDLP_PATH}" ${cookieFlag} --extractor-args "youtube:player_client=mweb" --no-warnings --no-check-certificates "ytsearch${limit}:${q}" --dump-json --flat-playlist --no-playlist`,
+        { maxBuffer: 1024 * 1024 * 20, timeout: 30000 },
+        (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim())
+      );
+    });
+    return raw.split('\n').filter(Boolean).map(line => {
+      try {
+        const d = JSON.parse(line);
+        if (!d.id || d.id.length !== 11) return null;
+        return {
+          id: d.id, title: d.title || '', artist: d.uploader || d.channel || '',
+          duration: d.duration || 0, durationStr: fmt(d.duration),
+          thumbnail: d.thumbnail || `https://img.youtube.com/vi/${d.id}/mqdefault.jpg`,
+          source: 'youtube',
+        };
+      } catch { return null; }
+    }).filter(Boolean);
+  } catch (e) {
+    console.warn('[yt-dlp search]', String(e).substring(0, 100));
+    return [];
+  }
+}
+
+// ─── Invidious search (fallback para búsqueda) ────────────────────────────────
 const INVIDIOUS = [
   'https://inv.tux.pizza',
   'https://invidious.io.lol',
@@ -98,42 +156,32 @@ const INVIDIOUS = [
   'https://yt.artemislena.eu',
   'https://inv.nadeko.net',
   'https://invidious.fdn.fr',
-  'https://invidious.privacydev.net',
 ];
 let invIdx = 0;
 
-async function ytSearch(q, limit = 15) {
-  for (let attempt = 0; attempt < INVIDIOUS.length; attempt++) {
-    const base = INVIDIOUS[invIdx % INVIDIOUS.length];
-    invIdx++;
+async function invSearch(q, limit = 15) {
+  for (let i = 0; i < INVIDIOUS.length; i++) {
+    const base = INVIDIOUS[invIdx++ % INVIDIOUS.length];
     try {
-      const data = await fetchJSON(
-        `${base}/api/v1/search?q=${encodeURIComponent(q)}&type=video&page=1`,
-        8000
-      );
+      const data = await fetchJSON(`${base}/api/v1/search?q=${encodeURIComponent(q)}&type=video&page=1`, 8000);
       const results = (Array.isArray(data) ? data : []).slice(0, limit).map(v => ({
-        id: v.videoId,
-        title: v.title || '',
-        artist: v.author || '',
-        duration: v.lengthSeconds || 0,
-        durationStr: fmt(v.lengthSeconds),
+        id: v.videoId, title: v.title || '', artist: v.author || '',
+        duration: v.lengthSeconds || 0, durationStr: fmt(v.lengthSeconds),
         thumbnail: `https://img.youtube.com/vi/${v.videoId}/mqdefault.jpg`,
         source: 'youtube',
       })).filter(v => v.id?.length === 11);
       if (results.length > 0) return results;
     } catch (e) {
-      console.warn(`[Invidious ${base}]`, e.message);
+      console.warn(`[Invidious search ${base}]`, e.message);
     }
   }
   return [];
 }
 
-// ─── YouTube audio via yt-dlp (prueba varios player_client) ──────────────────
-// ─── YouTube: obtener URL de audio con formato flexible ───────────────────────
+// ─── YouTube stream via redirect (yt-dlp resuelve URL, cliente hace el request) ──
 async function ytGetAudioUrl(videoId) {
   const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
   const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
-  // Sin filtro de formato — acepta lo que YouTube devuelva
   const clients = ['mweb', 'tv_embedded', 'ios', 'web'];
 
   for (const client of clients) {
@@ -149,42 +197,34 @@ async function ytGetAudioUrl(videoId) {
         return url;
       }
     } catch (e) {
-      console.warn(`[yt-dlp] client=${client} falló:`, String(e).substring(0, 120));
+      console.warn(`[yt-dlp] client=${client}:`, String(e).substring(0, 100));
     }
   }
   throw new Error('yt-dlp: todos los clients fallaron');
 }
 
-// ─── YouTube audio via Invidious (fallback) ───────────────────────────────────
+// ─── Invidious audio URL ──────────────────────────────────────────────────────
 async function invAudioUrl(videoId) {
-  for (let attempt = 0; attempt < INVIDIOUS.length; attempt++) {
-    const base = INVIDIOUS[invIdx % INVIDIOUS.length];
-    invIdx++;
+  for (let i = 0; i < INVIDIOUS.length; i++) {
+    const base = INVIDIOUS[invIdx++ % INVIDIOUS.length];
     try {
-      const data = await fetchJSON(
-        `${base}/api/v1/videos/${videoId}?fields=adaptiveFormats`,
-        10000
-      );
+      const data = await fetchJSON(`${base}/api/v1/videos/${videoId}?fields=adaptiveFormats`, 10000);
       const streams = (data.adaptiveFormats || [])
         .filter(f => f.type?.startsWith('audio/') && f.url)
         .sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0));
-      if (streams.length > 0) {
-        console.log(`[Invidious audio] ${base} ok`);
-        return streams[0].url;
-      }
+      if (streams.length > 0) return streams[0].url;
     } catch (e) {
       console.warn(`[Invidious audio ${base}]`, e.message);
     }
   }
-  throw new Error('All Invidious instances failed for audio');
+  throw new Error('Invidious: todos fallaron');
 }
 
 // ─── ffmpeg pipe ──────────────────────────────────────────────────────────────
 function pipeAudio(audioUrl, res, req, extraArgs = []) {
   const ff = spawn(ffmpegBin, [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    ...extraArgs,
-    '-i', audioUrl,
+    ...extraArgs, '-i', audioUrl,
     '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', '-f', 'mp3', 'pipe:1',
   ]);
   ff.stdout.pipe(res);
@@ -196,65 +236,44 @@ function pipeAudio(audioUrl, res, req, extraArgs = []) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.json({
-  status: 'ok',
-  message: 'Aletone API v4',
+  status: 'ok', message: 'Aletone API v5',
   cookiesLoaded: fs.existsSync(COOKIES_FILE),
   cookieBytes: fs.existsSync(COOKIES_FILE) ? fs.statSync(COOKIES_FILE).size : 0,
 }));
 
-// Search — JioSaavn first, YouTube to fill remainder
+// Search: JioSaavn primero → Invidious → yt-dlp
 app.get('/api/search', async (req, res) => {
   const { q, limit = 15 } = req.query;
   if (!q) return res.status(400).json({ error: 'Falta q' });
 
-  const [jsvResults, ytResults] = await Promise.allSettled([
+  const [jsvR, invR] = await Promise.allSettled([
     jiosaavnSearch(q, Number(limit)),
-    ytSearch(q, Number(limit)),
+    invSearch(q, Number(limit)),
   ]);
 
-  const jsv = jsvResults.status === 'fulfilled' ? jsvResults.value : [];
-  const yt  = ytResults.status  === 'fulfilled' ? ytResults.value  : [];
+  const jsv = jsvR.status === 'fulfilled' ? jsvR.value : [];
+  const inv = invR.status === 'fulfilled' ? invR.value : [];
 
   const combined = [...jsv];
   const needed = Number(limit) - combined.length;
-  if (needed > 0) combined.push(...yt.slice(0, needed));
+  if (needed > 0) combined.push(...inv.slice(0, needed));
 
   if (combined.length > 0) {
     return res.json({ results: combined, source: jsv.length > 0 ? 'mixed' : 'youtube' });
   }
 
   // Último recurso: yt-dlp search
-  try {
-    const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
-    const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
-    const raw = await new Promise((resolve, reject) => {
-      exec(`"${YTDLP_PATH}" ${cookieFlag} --extractor-args "youtube:player_client=mweb" --no-warnings --no-check-certificates "ytsearch${limit}:${q}" --dump-json --flat-playlist --no-playlist`,
-        { maxBuffer: 1024 * 1024 * 20, timeout: 30000 },
-        (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim()));
-    });
-    const results = raw.split('\n').filter(Boolean).map(line => {
-      try {
-        const d = JSON.parse(line);
-        if (!d.id || d.id.length !== 11) return null;
-        return {
-          id: d.id, title: d.title || '', artist: d.uploader || d.channel || '',
-          duration: d.duration || 0, durationStr: fmt(d.duration),
-          thumbnail: d.thumbnail || `https://img.youtube.com/vi/${d.id}/mqdefault.jpg`,
-          source: 'youtube',
-        };
-      } catch { return null; }
-    }).filter(Boolean);
-    return res.json({ results, source: 'ytdlp' });
-  } catch (err) {
-    res.status(500).json({ error: 'No se pudo buscar', detail: String(err) });
-  }
+  const ytR = await ytdlpSearch(q, Number(limit));
+  if (ytR.length > 0) return res.json({ results: ytR, source: 'ytdlp' });
+
+  res.status(500).json({ error: 'No se encontraron resultados' });
 });
 
 // Stream
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
-  // JioSaavn — pipe con ffmpeg (funciona bien)
+  // JioSaavn — pipe directo (funciona perfectamente)
   if (videoId.startsWith('jsv_')) {
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Transfer-Encoding', 'chunked');
@@ -265,35 +284,35 @@ app.get('/api/stream/:videoId', async (req, res) => {
       console.log('[Stream] JioSaavn ok');
       pipeAudio(audioUrl, res, req);
     } catch (e) {
-      console.error('[JioSaavn stream]', e.message);
+      console.error('[Stream JioSaavn]', e.message);
       if (!res.headersSent) res.status(500).json({ error: e.message });
     }
     return;
   }
 
-  // YouTube — redirige la URL directa (el cliente hace el request, no el servidor)
+  // YouTube — redirect (el navegador descarga directamente, no pasa por Render)
   console.log('[Stream] YouTube redirect:', videoId);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
   try {
-    const audioUrl = await ytGetAudioUrl(videoId);
-    console.log('[Stream] redirigiendo a:', audioUrl.substring(0, 80));
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.redirect(302, audioUrl);
-    return;
+    const url = await ytGetAudioUrl(videoId);
+    console.log('[Stream] yt-dlp redirect ok');
+    return res.redirect(302, url);
   } catch (e) {
-    console.warn('[Stream] yt-dlp falló, intentando Invidious:', e.message);
+    console.warn('[Stream] yt-dlp falló:', e.message);
   }
 
-  // Invidious fallback — también redirige
   try {
-    const audioUrl = await invAudioUrl(videoId);
+    const url = await invAudioUrl(videoId);
     console.log('[Stream] Invidious redirect ok');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.redirect(302, audioUrl);
-  } catch (err) {
-    console.error('[Stream] todo falló:', String(err).substring(0, 200));
-    if (!res.headersSent) res.status(500).json({ error: 'Stream failed', detail: String(err) });
+    return res.redirect(302, url);
+  } catch (e) {
+    console.warn('[Stream] Invidious falló:', e.message);
   }
+
+  if (!res.headersSent) res.status(500).json({ error: 'No se pudo obtener el stream de YouTube' });
 });
+
 // Download
 app.post('/api/download', async (req, res) => {
   const { videoId, title } = req.body;
@@ -309,38 +328,30 @@ app.post('/api/download', async (req, res) => {
     let audioUrl;
     if (videoId.startsWith('jsv_')) {
       audioUrl = await jiosaavnStreamUrl(videoId);
+      await new Promise((resolve, reject) => {
+        const ff = spawn(ffmpegBin, [
+          '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
+          '-i', audioUrl, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '192k', filepath,
+        ]);
+        ff.stderr.on('data', () => {});
+        ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`)));
+        ff.on('error', reject);
+      });
     } else {
-      try { audioUrl = await ytGetAudioUrl(videoId); }
-      catch { audioUrl = await invAudioUrl(videoId); }
+      // Para YouTube, yt-dlp descarga directamente
+      const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
+      const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
+      await new Promise((resolve, reject) => {
+        exec(
+          `"${YTDLP_PATH}" ${cookieFlag} --extractor-args "youtube:player_client=mweb" --no-warnings --no-check-certificates "https://www.youtube.com/watch?v=${videoId}" -x --audio-format mp3 --audio-quality 0 -o "${filepath}"`,
+          { maxBuffer: 1024 * 1024 * 50, timeout: 120000 },
+          (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve()
+        );
+      });
     }
-
-    await new Promise((resolve, reject) => {
-      const ff = spawn(ffmpegBin, [
-        '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-        '-i', audioUrl, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '192k', filepath,
-      ]);
-      ff.stderr.on('data', () => {});
-      ff.on('close', code => code === 0 ? resolve() : reject(new Error(`ffmpeg exit ${code}`)));
-      ff.on('error', reject);
-    });
-
     res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
   } catch (err) {
-    const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
-    const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
-    if (!videoId.startsWith('jsv_')) {
-      try {
-        await new Promise((resolve, reject) => {
-          exec(`"${YTDLP_PATH}" ${cookieFlag} --extractor-args "youtube:player_client=mweb" --no-warnings --no-check-certificates "https://www.youtube.com/watch?v=${videoId}" -x --audio-format mp3 --audio-quality 0 -o "${filepath}"`,
-            { maxBuffer: 1024 * 1024 * 20, timeout: 120000 },
-            (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim()));
-        });
-        return res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
-      } catch (e2) {
-        return res.status(500).json({ error: 'Download failed', detail: String(e2) });
-      }
-    }
-    res.status(500).json({ error: 'Download failed', detail: String(err) });
+    res.status(500).json({ error: 'Download failed', detail: String(err).substring(0, 300) });
   }
 });
 
@@ -355,4 +366,4 @@ setInterval(() => {
   } catch (_) {}
 }, 3600000);
 
-app.listen(PORT, () => console.log(`Aletone API v4 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Aletone API v5 en puerto ${PORT}`));
