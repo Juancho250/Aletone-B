@@ -2,11 +2,7 @@ services:
   - type: web
     name: aletone-api
     env: node
-    buildCommand: |
-      npm install
-      curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
-      chmod a+rx /usr/local/bin/yt-dlp
-      yt-dlp --version
+    buildCommand: npm install
     startCommand: node server.js
     envVars:
       - key: NODE_ENV

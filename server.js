@@ -90,21 +90,38 @@ app.get('/api/search', async (req, res) => {
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
+    // Obtener la URL directa del audio
     const audioUrl = await ytdlp(
       `"https://www.youtube.com/watch?v=${videoId}" -f bestaudio --get-url --no-warnings`
     );
     if (!audioUrl) return res.status(404).json({ error: 'No se encontró audio' });
 
-    const proto = audioUrl.startsWith('https') ? https : http;
-    const proxyReq = proto.get(audioUrl, (proxyRes) => {
-      res.setHeader('Content-Type', proxyRes.headers['content-type'] || 'audio/webm');
-      res.setHeader('Accept-Ranges', 'bytes');
-      if (proxyRes.headers['content-length']) {
-        res.setHeader('Content-Length', proxyRes.headers['content-length']);
-      }
-      proxyRes.pipe(res);
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Transfer-Encoding', 'chunked');
+
+    // Transcodificar con ffmpeg a MP3 compatible con todos los navegadores
+    const ffmpegBin = require('ffmpeg-static');
+    const { spawn } = require('child_process');
+
+    const ff = spawn(ffmpegBin, [
+      '-i', audioUrl,
+      '-vn',              // sin video
+      '-ar', '44100',     // sample rate estándar
+      '-ac', '2',         // stereo
+      '-b:a', '128k',     // bitrate
+      '-f', 'mp3',        // formato mp3
+      'pipe:1'            // output a stdout
+    ]);
+
+    ff.stdout.pipe(res);
+    ff.stderr.on('data', () => {}); // ignorar logs de ffmpeg
+
+    req.on('close', () => ff.kill('SIGKILL'));
+    ff.on('error', (err) => {
+      console.error('ffmpeg error:', err);
+      if (!res.headersSent) res.status(500).json({ error: 'Error en stream' });
     });
-    proxyReq.on('error', () => res.status(500).json({ error: 'Error en stream' }));
+
   } catch (err) {
     res.status(500).json({ error: 'Error al obtener stream', detail: String(err) });
   }
