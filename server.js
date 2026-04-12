@@ -7,6 +7,12 @@ const { spawn } = require('child_process');
 
 // ─── yt-dlp ──────────────────────────────────────────────────────────────────
 const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
+// ─── Cookies de YouTube ───────────────────────────────────────────────────────
+const COOKIES_FILE = path.join(__dirname, 'cookies.txt');
+if (process.env.YT_COOKIES) {
+  fs.writeFileSync(COOKIES_FILE, process.env.YT_COOKIES);
+  console.log('Cookies de YouTube cargadas ✓');
+}
 
 try {
   if (!fs.existsSync(YTDLP_PATH)) {
@@ -35,14 +41,15 @@ app.use(cors());
 app.use(express.json());
 app.use('/downloads', express.static(DOWNLOADS_DIR));
 
-// ─── Flags anti-bloqueo ───────────────────────────────────────────────────────
-// Esto le dice a YouTube que somos un cliente iOS, evita el bloqueo de IPs cloud
-const YT_FLAGS = `--extractor-args "youtube:player_client=ios" --no-warnings --no-check-certificates`;
-
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 function ytdlp(args) {
+  const cookieFlag = fs.existsSync(COOKIES_FILE)
+    ? `--cookies "${COOKIES_FILE}"`
+    : '';
+  const flags = `${cookieFlag} --extractor-args "youtube:player_client=ios" --no-warnings --no-check-certificates`;
+
   return new Promise((resolve, reject) => {
-    exec(`"${YTDLP_PATH}" ${YT_FLAGS} ${args}`, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+    exec(`"${YTDLP_PATH}" ${flags} ${args}`, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
       if (err) return reject(stderr || err.message);
       resolve(stdout.trim());
     });
