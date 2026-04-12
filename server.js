@@ -8,11 +8,13 @@ const { spawn } = require('child_process');
 // ─── yt-dlp ──────────────────────────────────────────────────────────────────
 const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 // ─── Cookies de YouTube ───────────────────────────────────────────────────────
-const COOKIES_FILE = path.join(__dirname, 'cookies.txt');
-if (process.env.YT_COOKIES) {
-  fs.writeFileSync(COOKIES_FILE, process.env.YT_COOKIES);
-  console.log('Cookies de YouTube cargadas ✓');
-}
+// ─── Cookies de YouTube ───────────────────────────────────────────────────────
+const COOKIES_FILE = fs.existsSync('/etc/secrets/cookies.txt')
+  ? '/etc/secrets/cookies.txt'
+  : path.join(__dirname, 'cookies.txt');
+
+// Ya no necesitas el bloque de YT_COOKIES, elimínalo:
+// if (process.env.YT_COOKIES) { ... }  ← borra esto
 
 try {
   if (!fs.existsSync(YTDLP_PATH)) {
