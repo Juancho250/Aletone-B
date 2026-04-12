@@ -9,21 +9,12 @@ const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 const COOKIES_SOURCE = '/etc/secrets/cookies.txt';
 const COOKIES_FILE = path.join(__dirname, 'yt-cookies.txt');
 
-// ─── Setup cookies ────────────────────────────────────────────────────────────
 if (fs.existsSync(COOKIES_SOURCE)) {
-  try {
-    fs.copyFileSync(COOKIES_SOURCE, COOKIES_FILE);
-    const size = fs.statSync(COOKIES_FILE).size;
-    console.log(`Cookies ✓ (${size} bytes)`);
-  } catch (e) { console.warn('Cookies no copiadas:', e.message); }
-} else {
-  console.warn('⚠ No se encontró cookies.txt en /etc/secrets/');
+  try { fs.copyFileSync(COOKIES_SOURCE, COOKIES_FILE); } catch (e) {}
 }
 
-// ─── Setup yt-dlp ─────────────────────────────────────────────────────────────
 try {
   if (!fs.existsSync(YTDLP_PATH)) {
-    console.log('Instalando yt-dlp...');
     execSync(`curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${YTDLP_PATH}"`, { stdio: 'inherit' });
   }
   execSync(`chmod a+rx "${YTDLP_PATH}"`, { stdio: 'inherit' });
@@ -38,7 +29,6 @@ const PORT = process.env.PORT || 3000;
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
-// ─── CORS — allow everything ──────────────────────────────────────────────────
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['*'] }));
 app.options('*', cors());
 app.use(express.json());
@@ -52,20 +42,20 @@ function fmt(s) {
 function sanitize(n) {
   return (n || 'track').replace(/[^a-z0-9\-_. ]/gi, '_').substring(0, 100);
 }
-async function fetchJSON(url, timeoutMs = 12000, headers = {}) {
+async function fetchJSON(url, timeoutMs = 12000, extraHeaders = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const r = await fetch(url, {
       signal: ctrl.signal,
-      headers: { 'User-Agent': 'Mozilla/5.0', ...headers },
+      headers: { 'User-Agent': 'Mozilla/5.0', ...extraHeaders },
     });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   } finally { clearTimeout(t); }
 }
 
-// ─── JioSaavn (free, no auth needed, great catalog) ──────────────────────────
+// ─── JioSaavn ─────────────────────────────────────────────────────────────────
 async function jiosaavnSearch(q, limit = 15) {
   try {
     const data = await fetchJSON(
@@ -90,79 +80,95 @@ async function jiosaavnStreamUrl(trackId) {
   const realId = trackId.replace('jsv_', '');
   const data = await fetchJSON(`https://saavn.dev/api/songs/${realId}`);
   const song = data?.data?.[0];
-  const url = song?.downloadUrl?.slice().reverse().find(u => u?.url)?.url;
-  if (!url) throw new Error('JioSaavn: no stream URL found');
+  const urls = song?.downloadUrl || [];
+  // highest quality first
+  const url = [...urls].reverse().find(u => u?.url)?.url;
+  if (!url) throw new Error('JioSaavn: no stream URL');
   return url;
 }
 
-// ─── Invidious (YouTube search fallback) ─────────────────────────────────────
+// ─── YouTube search via multiple Invidious instances ─────────────────────────
 const INVIDIOUS = [
   'https://inv.nadeko.net',
   'https://invidious.privacydev.net',
   'https://yt.drgnz.club',
   'https://iv.datura.network',
+  'https://invidious.fdn.fr',
 ];
 let invIdx = 0;
-const getInv = () => INVIDIOUS[invIdx % INVIDIOUS.length];
 
-async function invSearch(q, limit = 15) {
-  const base = getInv();
-  const data = await fetchJSON(
-    `${base}/api/v1/search?q=${encodeURIComponent(q)}&type=video&page=1`,
-    8000
-  );
-  return (Array.isArray(data) ? data : []).slice(0, limit).map(v => ({
-    id: v.videoId,
-    title: v.title || '',
-    artist: v.author || '',
-    duration: v.lengthSeconds || 0,
-    durationStr: fmt(v.lengthSeconds),
-    thumbnail: `https://img.youtube.com/vi/${v.videoId}/mqdefault.jpg`,
-    source: 'youtube',
-  })).filter(v => v.id?.length === 11);
+async function ytSearch(q, limit = 15) {
+  for (let attempt = 0; attempt < INVIDIOUS.length; attempt++) {
+    const base = INVIDIOUS[invIdx % INVIDIOUS.length];
+    invIdx++;
+    try {
+      const data = await fetchJSON(
+        `${base}/api/v1/search?q=${encodeURIComponent(q)}&type=video&page=1`,
+        8000
+      );
+      const results = (Array.isArray(data) ? data : []).slice(0, limit).map(v => ({
+        id: v.videoId,
+        title: v.title || '',
+        artist: v.author || '',
+        duration: v.lengthSeconds || 0,
+        durationStr: fmt(v.lengthSeconds),
+        thumbnail: `https://img.youtube.com/vi/${v.videoId}/mqdefault.jpg`,
+        source: 'youtube',
+      })).filter(v => v.id?.length === 11);
+      if (results.length > 0) return results;
+    } catch (e) {
+      console.warn(`[Invidious ${base}]`, e.message);
+    }
+  }
+  return [];
 }
 
-// ─── yt-dlp ───────────────────────────────────────────────────────────────────
+// ─── YouTube audio via yt-dlp (with multiple strategies) ─────────────────────
 function ytdlpExec(args, timeoutMs = 60000) {
   const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
   const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
-  const flags = `${cookieFlag} --extractor-args "youtube:player_client=ios,mweb" --no-warnings --no-check-certificates`;
+  const flags = `${cookieFlag} --extractor-args "youtube:player_client=ios,mweb,tv_embedded" --no-warnings --no-check-certificates`;
   return new Promise((resolve, reject) => {
     exec(`"${YTDLP_PATH}" ${flags} ${args}`, { maxBuffer: 1024 * 1024 * 20, timeout: timeoutMs },
       (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim()));
   });
 }
 
-async function ytdlpSearch(q, limit = 15) {
-  const raw = await ytdlpExec(`"ytsearch${limit}:${q}" --dump-json --flat-playlist --no-playlist`, 30000);
-  return raw.split('\n').filter(Boolean).map(line => {
-    try {
-      const d = JSON.parse(line);
-      if (!d.id || d.id.length !== 11) return null;
-      return {
-        id: d.id,
-        title: d.title || '',
-        artist: d.uploader || d.channel || '',
-        duration: d.duration || 0,
-        durationStr: fmt(d.duration),
-        thumbnail: d.thumbnail || `https://img.youtube.com/vi/${d.id}/mqdefault.jpg`,
-        source: 'youtube',
-      };
-    } catch { return null; }
-  }).filter(Boolean);
-}
-
-async function ytdlpGetAudioUrl(videoId) {
+async function ytGetAudioUrl(videoId) {
   const out = await ytdlpExec(
     `"https://www.youtube.com/watch?v=${videoId}" -f "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio" --get-url`,
     45000
   );
   const url = out.split('\n')[0].trim();
-  if (!url.startsWith('http')) throw new Error('No valid URL from yt-dlp');
+  if (!url.startsWith('http')) throw new Error('yt-dlp returned no URL');
   return url;
 }
 
-// ─── ffmpeg pipe helper ───────────────────────────────────────────────────────
+// ─── YouTube audio via Invidious stream (no yt-dlp needed) ───────────────────
+async function invAudioUrl(videoId) {
+  for (let attempt = 0; attempt < INVIDIOUS.length; attempt++) {
+    const base = INVIDIOUS[invIdx % INVIDIOUS.length];
+    invIdx++;
+    try {
+      const data = await fetchJSON(
+        `${base}/api/v1/videos/${videoId}?fields=adaptiveFormats`,
+        10000
+      );
+      const streams = (data.adaptiveFormats || [])
+        .filter(f => f.type?.startsWith('audio/') && f.url)
+        .sort((a, b) => (parseInt(b.bitrate) || 0) - (parseInt(a.bitrate) || 0));
+      if (streams.length > 0) {
+        console.log(`[Invidious audio] ${base} ok`);
+        return streams[0].url;
+      }
+    } catch (e) {
+      console.warn(`[Invidious audio ${base}]`, e.message);
+    }
+  }
+  throw new Error('All Invidious instances failed for audio');
+}
+
+// ─── ffmpeg pipe ──────────────────────────────────────────────────────────────
 function pipeAudio(audioUrl, res, req, extraArgs = []) {
   const ff = spawn(ffmpegBin, [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
@@ -172,41 +178,57 @@ function pipeAudio(audioUrl, res, req, extraArgs = []) {
   ]);
   ff.stdout.pipe(res);
   ff.stderr.on('data', () => {});
-  req.on('close', () => ff.kill('SIGKILL'));
-  ff.on('error', e => { if (!res.headersSent) res.status(500).end(); });
+  req.on('close', () => { try { ff.kill('SIGKILL'); } catch (_) {} });
+  ff.on('error', () => { if (!res.headersSent) res.status(500).end(); });
+  ff.on('close', code => { if (code !== 0 && !res.headersSent) res.status(500).end(); });
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => res.json({
   status: 'ok',
-  message: 'Aletone API v3',
+  message: 'Aletone API v4',
   cookiesLoaded: fs.existsSync(COOKIES_FILE),
   cookieBytes: fs.existsSync(COOKIES_FILE) ? fs.statSync(COOKIES_FILE).size : 0,
 }));
 
-// Search: JioSaavn → Invidious → yt-dlp
+// Search — JioSaavn first, then YouTube
 app.get('/api/search', async (req, res) => {
   const { q, limit = 15 } = req.query;
   if (!q) return res.status(400).json({ error: 'Falta q' });
 
-  // 1. JioSaavn
-  const jsv = await jiosaavnSearch(q, Number(limit));
-  if (jsv.length > 0) return res.json({ results: jsv, source: 'jiosaavn' });
+  // Run both searches in parallel for speed
+  const [jsvResults, ytResults] = await Promise.allSettled([
+    jiosaavnSearch(q, Number(limit)),
+    ytSearch(q, Number(limit)),
+  ]);
 
-  // 2. Invidious rotation
-  for (let i = 0; i < INVIDIOUS.length; i++) {
-    try {
-      const results = await invSearch(q, Number(limit));
-      if (results.length > 0) return res.json({ results, source: `invidious:${getInv()}` });
-    } catch (e) {
-      console.warn(`[Invidious] ${getInv()} fallo: ${e.message}`);
-      invIdx++;
-    }
+  const jsv = jsvResults.status === 'fulfilled' ? jsvResults.value : [];
+  const yt  = ytResults.status  === 'fulfilled' ? ytResults.value  : [];
+
+  // Merge: JioSaavn first (reliable stream), then YouTube to fill remainder
+  const combined = [...jsv];
+  const needed = Number(limit) - combined.length;
+  if (needed > 0) combined.push(...yt.slice(0, needed));
+
+  if (combined.length > 0) {
+    return res.json({ results: combined, source: jsv.length > 0 ? 'mixed' : 'youtube' });
   }
 
-  // 3. yt-dlp
+  // Last resort: yt-dlp search
   try {
-    const results = await ytdlpSearch(q, Number(limit));
+    const raw = await ytdlpExec(`"ytsearch${limit}:${q}" --dump-json --flat-playlist --no-playlist`, 30000);
+    const results = raw.split('\n').filter(Boolean).map(line => {
+      try {
+        const d = JSON.parse(line);
+        if (!d.id || d.id.length !== 11) return null;
+        return {
+          id: d.id, title: d.title || '', artist: d.uploader || d.channel || '',
+          duration: d.duration || 0, durationStr: fmt(d.duration),
+          thumbnail: d.thumbnail || `https://img.youtube.com/vi/${d.id}/mqdefault.jpg`,
+          source: 'youtube',
+        };
+      } catch { return null; }
+    }).filter(Boolean);
     return res.json({ results, source: 'ytdlp' });
   } catch (err) {
     res.status(500).json({ error: 'No se pudo buscar', detail: String(err) });
@@ -221,10 +243,11 @@ app.get('/api/stream/:videoId', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-cache');
 
-  // JioSaavn
+  // JioSaavn — direct, reliable
   if (videoId.startsWith('jsv_')) {
     try {
       const audioUrl = await jiosaavnStreamUrl(videoId);
+      console.log('[Stream] JioSaavn ok');
       pipeAudio(audioUrl, res, req);
     } catch (e) {
       console.error('[JioSaavn stream]', e.message);
@@ -233,14 +256,25 @@ app.get('/api/stream/:videoId', async (req, res) => {
     return;
   }
 
-  // YouTube
+  // YouTube — try Invidious first (no bot check), then yt-dlp
+  console.log('[Stream] YouTube:', videoId);
   try {
-    const audioUrl = await ytdlpGetAudioUrl(videoId);
+    const audioUrl = await invAudioUrl(videoId);
+    console.log('[Stream] Invidious audio ok');
+    pipeAudio(audioUrl, res, req);
+    return;
+  } catch (e) {
+    console.warn('[Stream] Invidious audio failed, trying yt-dlp:', e.message);
+  }
+
+  try {
+    const audioUrl = await ytGetAudioUrl(videoId);
+    console.log('[Stream] yt-dlp ok');
     pipeAudio(audioUrl, res, req, [
       '-user_agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
     ]);
   } catch (err) {
-    console.error('[YouTube stream]', String(err).substring(0, 200));
+    console.error('[Stream] all methods failed:', String(err).substring(0, 200));
     if (!res.headersSent) res.status(500).json({ error: 'Stream failed', detail: String(err) });
   }
 });
@@ -261,7 +295,8 @@ app.post('/api/download', async (req, res) => {
     if (videoId.startsWith('jsv_')) {
       audioUrl = await jiosaavnStreamUrl(videoId);
     } else {
-      audioUrl = await ytdlpGetAudioUrl(videoId);
+      try { audioUrl = await invAudioUrl(videoId); }
+      catch { audioUrl = await ytGetAudioUrl(videoId); }
     }
 
     await new Promise((resolve, reject) => {
@@ -276,7 +311,7 @@ app.post('/api/download', async (req, res) => {
 
     res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
   } catch (err) {
-    // Last resort for YouTube: yt-dlp direct download
+    // yt-dlp direct download as last resort
     if (!videoId.startsWith('jsv_')) {
       try {
         await ytdlpExec(
@@ -292,7 +327,7 @@ app.post('/api/download', async (req, res) => {
   }
 });
 
-// Cleanup old downloads
+// Cleanup
 setInterval(() => {
   try {
     const now = Date.now();
@@ -303,4 +338,4 @@ setInterval(() => {
   } catch (_) {}
 }, 3600000);
 
-app.listen(PORT, () => console.log(`Aletone API v3 en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Aletone API v4 en puerto ${PORT}`));
