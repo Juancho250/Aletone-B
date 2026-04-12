@@ -5,8 +5,9 @@ const https = require('https');
 const http = require('http');
 const express = require('express');
 const cors = require('cors');
+const { spawn } = require('child_process');
 
-// ─── Auto-instalar yt-dlp en carpeta local ───────────────────────────────────
+// ─── Auto-instalar yt-dlp ────────────────────────────────────────────────────
 const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
 
 if (!fs.existsSync(YTDLP_PATH)) {
@@ -20,11 +21,9 @@ if (!fs.existsSync(YTDLP_PATH)) {
   }
 }
 
-// ─── PATH con ffmpeg ─────────────────────────────────────────────────────────
-const ffmpegPath = require('ffmpeg-static');
-process.env.PATH = `${__dirname}:${path.dirname(ffmpegPath)}:${process.env.PATH}`;
+const ffmpegBin = require('ffmpeg-static');
+process.env.PATH = `${__dirname}:${path.dirname(ffmpegBin)}:${process.env.PATH}`;
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
 const app = express();
 const PORT = process.env.PORT || 3000;
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
@@ -56,10 +55,10 @@ function formatDuration(seconds) {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-// ─── Rutas ────────────────────────────────────────────────────────────────────
-
+// ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'MusiCloud API' }));
 
+// ─── Buscar ───────────────────────────────────────────────────────────────────
 app.get('/api/search', async (req, res) => {
   const { q, limit = 10 } = req.query;
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
@@ -70,7 +69,6 @@ app.get('/api/search', async (req, res) => {
     const results = raw.split('\n').filter(Boolean).map(line => {
       try {
         const d = JSON.parse(line);
-        // ✅ Filtrar: solo videos (tienen duration y ID corto de 11 chars)
         if (!d.id || d.id.length !== 11 || !d.duration) return null;
         return {
           id: d.id,
@@ -89,38 +87,49 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
+// ─── Obtener URL directa (para reproducción instantánea) ──────────────────────
+app.get('/api/url/:videoId', async (req, res) => {
+  const { videoId } = req.params;
+  try {
+    const audioUrl = await ytdlp(
+      `"https://www.youtube.com/watch?v=${videoId}" -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" --get-url --no-warnings`
+    );
+    if (!audioUrl) return res.status(404).json({ error: 'No encontrado' });
+    res.json({ url: audioUrl });
+  } catch (err) {
+    res.status(500).json({ error: 'Error', detail: String(err) });
+  }
+});
+
+// ─── Stream con ffmpeg (fallback compatible con todos los navegadores) ─────────
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
-    // Obtener la URL directa del audio
     const audioUrl = await ytdlp(
-      `"https://www.youtube.com/watch?v=${videoId}" -f bestaudio --get-url --no-warnings`
+      `"https://www.youtube.com/watch?v=${videoId}" -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" --get-url --no-warnings`
     );
     if (!audioUrl) return res.status(404).json({ error: 'No se encontró audio' });
 
     res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Transfer-Encoding', 'chunked');
 
-    // Transcodificar con ffmpeg a MP3 compatible con todos los navegadores
-    const ffmpegBin = require('ffmpeg-static');
-    const { spawn } = require('child_process');
-
     const ff = spawn(ffmpegBin, [
+      '-reconnect', '1',
+      '-reconnect_streamed', '1',
+      '-reconnect_delay_max', '5',
       '-i', audioUrl,
-      '-vn',              // sin video
-      '-ar', '44100',     // sample rate estándar
-      '-ac', '2',         // stereo
-      '-b:a', '128k',     // bitrate
-      '-f', 'mp3',        // formato mp3
-      'pipe:1'            // output a stdout
+      '-vn',
+      '-ar', '44100',
+      '-ac', '2',
+      '-b:a', '128k',
+      '-f', 'mp3',
+      'pipe:1'
     ]);
 
     ff.stdout.pipe(res);
-    ff.stderr.on('data', () => {}); // ignorar logs de ffmpeg
-
+    ff.stderr.on('data', () => {});
     req.on('close', () => ff.kill('SIGKILL'));
-    ff.on('error', (err) => {
-      console.error('ffmpeg error:', err);
+    ff.on('error', () => {
       if (!res.headersSent) res.status(500).json({ error: 'Error en stream' });
     });
 
@@ -129,6 +138,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
   }
 });
 
+// ─── Descargar MP3 ────────────────────────────────────────────────────────────
 app.post('/api/download', async (req, res) => {
   const { videoId, title } = req.body;
   if (!videoId) return res.status(400).json({ error: 'Falta videoId' });
@@ -150,33 +160,15 @@ app.post('/api/download', async (req, res) => {
   }
 });
 
-app.get('/api/info/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  try {
-    const raw = await ytdlp(
-      `"https://www.youtube.com/watch?v=${videoId}" --dump-json --no-warnings`
-    );
-    const d = JSON.parse(raw);
-    res.json({
-      id: d.id,
-      title: d.title,
-      artist: d.uploader || d.channel || '',
-      duration: d.duration,
-      durationStr: formatDuration(d.duration),
-      thumbnail: d.thumbnail,
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Error al obtener info', detail: String(err) });
-  }
-});
-
 // ─── Limpieza cada hora ───────────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
-  fs.readdirSync(DOWNLOADS_DIR).forEach(f => {
-    const fp = path.join(DOWNLOADS_DIR, f);
-    if (now - fs.statSync(fp).mtimeMs > 24 * 60 * 60 * 1000) fs.unlinkSync(fp);
-  });
+  try {
+    fs.readdirSync(DOWNLOADS_DIR).forEach(f => {
+      const fp = path.join(DOWNLOADS_DIR, f);
+      if (now - fs.statSync(fp).mtimeMs > 24 * 60 * 60 * 1000) fs.unlinkSync(fp);
+    });
+  } catch(e) {}
 }, 60 * 60 * 1000);
 
 app.listen(PORT, () => console.log(`MusiCloud API corriendo en puerto ${PORT}`));
