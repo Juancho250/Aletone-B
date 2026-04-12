@@ -57,23 +57,27 @@ async function fetchJSON(url, timeoutMs = 12000, extraHeaders = {}) {
 
 // ─── JioSaavn ─────────────────────────────────────────────────────────────────
 async function jiosaavnSearch(q, limit = 15) {
-  try {
-    const data = await fetchJSON(
-      `https://saavn.dev/api/search/songs?query=${encodeURIComponent(q)}&page=1&limit=${limit}`
-    );
-    return (data?.data?.results || []).map(s => ({
-      id: `jsv_${s.id}`,
-      title: s.name || '',
-      artist: (s.artists?.primary || []).map(a => a.name).join(', ') || '',
-      duration: s.duration || 0,
-      durationStr: fmt(s.duration),
-      thumbnail: s.image?.[2]?.url || s.image?.[1]?.url || '',
-      source: 'jiosaavn',
-    })).filter(s => s.id);
-  } catch (e) {
-    console.warn('[JioSaavn search]', e.message);
-    return [];
+  const queries = [q, q.split(' ').slice(0, 2).join(' ')];
+  for (const query of queries) {
+    try {
+      const data = await fetchJSON(
+        `https://saavn.dev/api/search/songs?query=${encodeURIComponent(query)}&page=1&limit=${limit}`
+      );
+      const results = (data?.data?.results || []).map(s => ({
+        id: `jsv_${s.id}`,
+        title: s.name || '',
+        artist: (s.artists?.primary || []).map(a => a.name).join(', ') || '',
+        duration: s.duration || 0,
+        durationStr: fmt(s.duration),
+        thumbnail: s.image?.[2]?.url || s.image?.[1]?.url || '',
+        source: 'jiosaavn',
+      })).filter(s => s.id);
+      if (results.length > 0) return results;
+    } catch (e) {
+      console.warn('[JioSaavn search]', e.message);
+    }
   }
+  return [];
 }
 
 async function jiosaavnStreamUrl(trackId) {
@@ -81,7 +85,6 @@ async function jiosaavnStreamUrl(trackId) {
   const data = await fetchJSON(`https://saavn.dev/api/songs/${realId}`);
   const song = data?.data?.[0];
   const urls = song?.downloadUrl || [];
-  // highest quality first
   const url = [...urls].reverse().find(u => u?.url)?.url;
   if (!url) throw new Error('JioSaavn: no stream URL');
   return url;
@@ -89,11 +92,13 @@ async function jiosaavnStreamUrl(trackId) {
 
 // ─── YouTube search via multiple Invidious instances ─────────────────────────
 const INVIDIOUS = [
+  'https://inv.tux.pizza',
+  'https://invidious.io.lol',
+  'https://invidious.privacyredirect.com',
+  'https://yt.artemislena.eu',
   'https://inv.nadeko.net',
-  'https://invidious.privacydev.net',
-  'https://yt.drgnz.club',
-  'https://iv.datura.network',
   'https://invidious.fdn.fr',
+  'https://invidious.privacydev.net',
 ];
 let invIdx = 0;
 
@@ -123,28 +128,36 @@ async function ytSearch(q, limit = 15) {
   return [];
 }
 
-// ─── YouTube audio via yt-dlp (with multiple strategies) ─────────────────────
-function ytdlpExec(args, timeoutMs = 60000) {
+// ─── YouTube audio via yt-dlp (prueba varios player_client) ──────────────────
+async function ytGetAudioUrl(videoId) {
   const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
   const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
-  const flags = `${cookieFlag} --extractor-args "youtube:player_client=ios,mweb,tv_embedded" --no-warnings --no-check-certificates`;
-  return new Promise((resolve, reject) => {
-    exec(`"${YTDLP_PATH}" ${flags} ${args}`, { maxBuffer: 1024 * 1024 * 20, timeout: timeoutMs },
-      (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim()));
-  });
+  const clients = ['mweb', 'tv_embedded', 'ios,mweb', 'web_embedded,tv_embedded'];
+
+  for (const client of clients) {
+    try {
+      const cmd = `"${YTDLP_PATH}" ${cookieFlag} \
+        --extractor-args "youtube:player_client=${client}" \
+        --no-warnings --no-check-certificates \
+        "https://www.youtube.com/watch?v=${videoId}" \
+        -f "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio" --get-url`;
+      const out = await new Promise((resolve, reject) => {
+        exec(cmd, { maxBuffer: 1024 * 1024 * 20, timeout: 45000 },
+          (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim()));
+      });
+      const url = out.split('\n')[0].trim();
+      if (url.startsWith('http')) {
+        console.log(`[yt-dlp] ok client=${client}`);
+        return url;
+      }
+    } catch (e) {
+      console.warn(`[yt-dlp] client=${client} falló:`, String(e).substring(0, 120));
+    }
+  }
+  throw new Error('yt-dlp: todos los clients fallaron');
 }
 
-async function ytGetAudioUrl(videoId) {
-  const out = await ytdlpExec(
-    `"https://www.youtube.com/watch?v=${videoId}" -f "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio" --get-url`,
-    45000
-  );
-  const url = out.split('\n')[0].trim();
-  if (!url.startsWith('http')) throw new Error('yt-dlp returned no URL');
-  return url;
-}
-
-// ─── YouTube audio via Invidious stream (no yt-dlp needed) ───────────────────
+// ─── YouTube audio via Invidious (fallback) ───────────────────────────────────
 async function invAudioUrl(videoId) {
   for (let attempt = 0; attempt < INVIDIOUS.length; attempt++) {
     const base = INVIDIOUS[invIdx % INVIDIOUS.length];
@@ -191,12 +204,11 @@ app.get('/', (_req, res) => res.json({
   cookieBytes: fs.existsSync(COOKIES_FILE) ? fs.statSync(COOKIES_FILE).size : 0,
 }));
 
-// Search — JioSaavn first, then YouTube
+// Search — JioSaavn first, YouTube to fill remainder
 app.get('/api/search', async (req, res) => {
   const { q, limit = 15 } = req.query;
   if (!q) return res.status(400).json({ error: 'Falta q' });
 
-  // Run both searches in parallel for speed
   const [jsvResults, ytResults] = await Promise.allSettled([
     jiosaavnSearch(q, Number(limit)),
     ytSearch(q, Number(limit)),
@@ -205,7 +217,6 @@ app.get('/api/search', async (req, res) => {
   const jsv = jsvResults.status === 'fulfilled' ? jsvResults.value : [];
   const yt  = ytResults.status  === 'fulfilled' ? ytResults.value  : [];
 
-  // Merge: JioSaavn first (reliable stream), then YouTube to fill remainder
   const combined = [...jsv];
   const needed = Number(limit) - combined.length;
   if (needed > 0) combined.push(...yt.slice(0, needed));
@@ -214,9 +225,15 @@ app.get('/api/search', async (req, res) => {
     return res.json({ results: combined, source: jsv.length > 0 ? 'mixed' : 'youtube' });
   }
 
-  // Last resort: yt-dlp search
+  // Último recurso: yt-dlp search
   try {
-    const raw = await ytdlpExec(`"ytsearch${limit}:${q}" --dump-json --flat-playlist --no-playlist`, 30000);
+    const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
+    const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
+    const raw = await new Promise((resolve, reject) => {
+      exec(`"${YTDLP_PATH}" ${cookieFlag} --extractor-args "youtube:player_client=mweb" --no-warnings --no-check-certificates "ytsearch${limit}:${q}" --dump-json --flat-playlist --no-playlist`,
+        { maxBuffer: 1024 * 1024 * 20, timeout: 30000 },
+        (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim()));
+    });
     const results = raw.split('\n').filter(Boolean).map(line => {
       try {
         const d = JSON.parse(line);
@@ -243,7 +260,7 @@ app.get('/api/stream/:videoId', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-cache');
 
-  // JioSaavn — direct, reliable
+  // JioSaavn — directo y confiable
   if (videoId.startsWith('jsv_')) {
     try {
       const audioUrl = await jiosaavnStreamUrl(videoId);
@@ -256,25 +273,25 @@ app.get('/api/stream/:videoId', async (req, res) => {
     return;
   }
 
-  // YouTube — try Invidious first (no bot check), then yt-dlp
+  // YouTube — yt-dlp primero (tenemos cookies), Invidious como fallback
   console.log('[Stream] YouTube:', videoId);
-  try {
-    const audioUrl = await invAudioUrl(videoId);
-    console.log('[Stream] Invidious audio ok');
-    pipeAudio(audioUrl, res, req);
-    return;
-  } catch (e) {
-    console.warn('[Stream] Invidious audio failed, trying yt-dlp:', e.message);
-  }
-
   try {
     const audioUrl = await ytGetAudioUrl(videoId);
     console.log('[Stream] yt-dlp ok');
     pipeAudio(audioUrl, res, req, [
       '-user_agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
     ]);
+    return;
+  } catch (e) {
+    console.warn('[Stream] yt-dlp falló, intentando Invidious:', e.message);
+  }
+
+  try {
+    const audioUrl = await invAudioUrl(videoId);
+    console.log('[Stream] Invidious ok');
+    pipeAudio(audioUrl, res, req);
   } catch (err) {
-    console.error('[Stream] all methods failed:', String(err).substring(0, 200));
+    console.error('[Stream] todo falló:', String(err).substring(0, 200));
     if (!res.headersSent) res.status(500).json({ error: 'Stream failed', detail: String(err) });
   }
 });
@@ -295,8 +312,8 @@ app.post('/api/download', async (req, res) => {
     if (videoId.startsWith('jsv_')) {
       audioUrl = await jiosaavnStreamUrl(videoId);
     } else {
-      try { audioUrl = await invAudioUrl(videoId); }
-      catch { audioUrl = await ytGetAudioUrl(videoId); }
+      try { audioUrl = await ytGetAudioUrl(videoId); }
+      catch { audioUrl = await invAudioUrl(videoId); }
     }
 
     await new Promise((resolve, reject) => {
@@ -311,13 +328,15 @@ app.post('/api/download', async (req, res) => {
 
     res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
   } catch (err) {
-    // yt-dlp direct download as last resort
+    const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
+    const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
     if (!videoId.startsWith('jsv_')) {
       try {
-        await ytdlpExec(
-          `"https://www.youtube.com/watch?v=${videoId}" -x --audio-format mp3 --audio-quality 0 -o "${filepath}"`,
-          120000
-        );
+        await new Promise((resolve, reject) => {
+          exec(`"${YTDLP_PATH}" ${cookieFlag} --extractor-args "youtube:player_client=mweb" --no-warnings --no-check-certificates "https://www.youtube.com/watch?v=${videoId}" -x --audio-format mp3 --audio-quality 0 -o "${filepath}"`,
+            { maxBuffer: 1024 * 1024 * 20, timeout: 120000 },
+            (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim()));
+        });
         return res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
       } catch (e2) {
         return res.status(500).json({ error: 'Download failed', detail: String(e2) });
