@@ -1,3 +1,7 @@
+// Agregar al inicio, antes de todo
+const ffmpegPath = require('ffmpeg-static');
+process.env.PATH = `${require('path').dirname(ffmpegPath)}:${process.env.PATH}`;
+
 const express = require('express');
 const cors = require('cors');
 const { exec, spawn } = require('child_process');
