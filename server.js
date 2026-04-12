@@ -6,13 +6,15 @@ const http = require('http');
 const express = require('express');
 const cors = require('cors');
 
-// ─── Auto-instalar yt-dlp ────────────────────────────────────────────────────
-if (!fs.existsSync('/usr/local/bin/yt-dlp')) {
+// ─── Auto-instalar yt-dlp en carpeta local ───────────────────────────────────
+const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
+
+if (!fs.existsSync(YTDLP_PATH)) {
   console.log('Instalando yt-dlp...');
   try {
-    execSync('curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp', { stdio: 'inherit' });
-    execSync('chmod a+rx /usr/local/bin/yt-dlp', { stdio: 'inherit' });
-    console.log('yt-dlp listo:', execSync('yt-dlp --version').toString().trim());
+    execSync(`curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${YTDLP_PATH}"`, { stdio: 'inherit' });
+    execSync(`chmod a+rx "${YTDLP_PATH}"`, { stdio: 'inherit' });
+    console.log('yt-dlp listo:', execSync(`"${YTDLP_PATH}" --version`).toString().trim());
   } catch(e) {
     console.error('Error instalando yt-dlp:', e.message);
   }
@@ -20,7 +22,7 @@ if (!fs.existsSync('/usr/local/bin/yt-dlp')) {
 
 // ─── PATH con ffmpeg ─────────────────────────────────────────────────────────
 const ffmpegPath = require('ffmpeg-static');
-process.env.PATH = `/usr/local/bin:${path.dirname(ffmpegPath)}:${process.env.PATH}`;
+process.env.PATH = `${__dirname}:${path.dirname(ffmpegPath)}:${process.env.PATH}`;
 
 // ─── Setup ───────────────────────────────────────────────────────────────────
 const app = express();
@@ -36,7 +38,7 @@ app.use('/downloads', express.static(DOWNLOADS_DIR));
 // ─── Utilidades ───────────────────────────────────────────────────────────────
 function ytdlp(args) {
   return new Promise((resolve, reject) => {
-    exec(`yt-dlp ${args}`, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
+    exec(`"${YTDLP_PATH}" ${args}`, { maxBuffer: 1024 * 1024 * 10 }, (err, stdout, stderr) => {
       if (err) return reject(stderr || err.message);
       resolve(stdout.trim());
     });
