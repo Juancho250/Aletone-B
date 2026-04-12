@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: musicloud-api
+    env: node
+    buildCommand: |
+      npm install
+      apt-get update && apt-get install -y python3 python3-pip ffmpeg
+      pip3 install yt-dlp
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+    disk:
+      name: downloads
+      mountPath: /opt/render/project/src/downloads
+      sizeGB: 5
