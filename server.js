@@ -129,18 +129,16 @@ async function ytSearch(q, limit = 15) {
 }
 
 // ─── YouTube audio via yt-dlp (prueba varios player_client) ──────────────────
+// ─── YouTube: obtener URL de audio con formato flexible ───────────────────────
 async function ytGetAudioUrl(videoId) {
   const hasCookies = fs.existsSync(COOKIES_FILE) && fs.statSync(COOKIES_FILE).size > 100;
   const cookieFlag = hasCookies ? `--cookies "${COOKIES_FILE}"` : '';
-  const clients = ['mweb', 'tv_embedded', 'ios,mweb', 'web_embedded,tv_embedded'];
+  // Sin filtro de formato — acepta lo que YouTube devuelva
+  const clients = ['mweb', 'tv_embedded', 'ios', 'web'];
 
   for (const client of clients) {
     try {
-      const cmd = `"${YTDLP_PATH}" ${cookieFlag} \
-        --extractor-args "youtube:player_client=${client}" \
-        --no-warnings --no-check-certificates \
-        "https://www.youtube.com/watch?v=${videoId}" \
-        -f "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio" --get-url`;
+      const cmd = `"${YTDLP_PATH}" ${cookieFlag} --extractor-args "youtube:player_client=${client}" --no-warnings --no-check-certificates "https://www.youtube.com/watch?v=${videoId}" -f "bestaudio" --get-url`;
       const out = await new Promise((resolve, reject) => {
         exec(cmd, { maxBuffer: 1024 * 1024 * 20, timeout: 45000 },
           (err, stdout, stderr) => err ? reject(stderr || err.message) : resolve(stdout.trim()));
@@ -255,13 +253,13 @@ app.get('/api/search', async (req, res) => {
 // Stream
 app.get('/api/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
-  res.setHeader('Content-Type', 'audio/mpeg');
-  res.setHeader('Transfer-Encoding', 'chunked');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-cache');
 
-  // JioSaavn — directo y confiable
+  // JioSaavn — pipe con ffmpeg (funciona bien)
   if (videoId.startsWith('jsv_')) {
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Transfer-Encoding', 'chunked');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-cache');
     try {
       const audioUrl = await jiosaavnStreamUrl(videoId);
       console.log('[Stream] JioSaavn ok');
@@ -273,29 +271,29 @@ app.get('/api/stream/:videoId', async (req, res) => {
     return;
   }
 
-  // YouTube — yt-dlp primero (tenemos cookies), Invidious como fallback
-  console.log('[Stream] YouTube:', videoId);
+  // YouTube — redirige la URL directa (el cliente hace el request, no el servidor)
+  console.log('[Stream] YouTube redirect:', videoId);
   try {
     const audioUrl = await ytGetAudioUrl(videoId);
-    console.log('[Stream] yt-dlp ok');
-    pipeAudio(audioUrl, res, req, [
-      '-user_agent', 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15',
-    ]);
+    console.log('[Stream] redirigiendo a:', audioUrl.substring(0, 80));
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.redirect(302, audioUrl);
     return;
   } catch (e) {
     console.warn('[Stream] yt-dlp falló, intentando Invidious:', e.message);
   }
 
+  // Invidious fallback — también redirige
   try {
     const audioUrl = await invAudioUrl(videoId);
-    console.log('[Stream] Invidious ok');
-    pipeAudio(audioUrl, res, req);
+    console.log('[Stream] Invidious redirect ok');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.redirect(302, audioUrl);
   } catch (err) {
     console.error('[Stream] todo falló:', String(err).substring(0, 200));
     if (!res.headersSent) res.status(500).json({ error: 'Stream failed', detail: String(err) });
   }
 });
-
 // Download
 app.post('/api/download', async (req, res) => {
   const { videoId, title } = req.body;
