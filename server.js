@@ -105,23 +105,29 @@ async function scStreamUrl(trackId) {
   const cid = await getSCClientId();
   const rawId = trackId.replace('sc_', '');
 
-  // Obtiene los formatos de stream disponibles
+  // Primero obtener los streams disponibles del track
   const data = await fetchJSON(
-    `https://api-v2.soundcloud.com/tracks/${rawId}/streams?client_id=${cid}`
+    `https://api-v2.soundcloud.com/tracks/${rawId}?client_id=${cid}`
   );
 
-  // Preferimos progressive (MP3 directo) sobre HLS
-  const progressive = data?.http_mp3_128_url || data?.preview_mp3_128_url;
-  if (progressive) return progressive;
+  // Buscar transcoding MP3 progresivo (mejor calidad, sin HLS)
+  const transcodings = data?.media?.transcodings || [];
+  
+  const progressive = transcodings.find(t => 
+    t.format?.protocol === 'progressive' && t.format?.mime_type === 'audio/mpeg'
+  );
+  const hls = transcodings.find(t =>
+    t.format?.protocol === 'hls' && t.format?.mime_type === 'audio/mpeg'
+  );
 
-  // Fallback: HLS → pedir la URL de la playlist y resolver
-  const hlsTranscode = data?.hls_mp3_128_url;
-  if (hlsTranscode) {
-    const res = await fetchJSON(`${hlsTranscode}&client_id=${cid}`);
-    return res?.url || null;
-  }
+  const transcoding = progressive || hls;
+  if (!transcoding?.url) throw new Error('SoundCloud: no transcodings disponibles');
 
-  throw new Error('SoundCloud: no stream URL disponible');
+  // Resolver la URL real del stream
+  const resolved = await fetchJSON(`${transcoding.url}?client_id=${cid}`);
+  if (!resolved?.url) throw new Error('SoundCloud: URL de stream no resuelta');
+  
+  return resolved.url;
 }
 
 // ─── Deezer ───────────────────────────────────────────────────────────────────
