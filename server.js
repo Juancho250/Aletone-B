@@ -1,22 +1,10 @@
-const { execSync } = require('child_process');
-const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const { spawn } = require('child_process');
 
-const YTDLP_PATH = path.join(__dirname, 'yt-dlp');
-try {
-  if (!fs.existsSync(YTDLP_PATH)) {
-    execSync(`curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "${YTDLP_PATH}"`, { stdio: 'inherit' });
-  }
-  execSync(`chmod a+rx "${YTDLP_PATH}"`, { stdio: 'inherit' });
-  console.log('yt-dlp:', execSync(`"${YTDLP_PATH}" --version`).toString().trim());
-} catch (e) { console.error('yt-dlp setup error:', e.message); }
-
 const ffmpegBin = require('ffmpeg-static');
-process.env.PATH = `${__dirname}:${path.dirname(ffmpegBin)}:${process.env.PATH}`;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -37,182 +25,138 @@ function sanitize(n) {
   return (n || 'track').replace(/[^a-z0-9\-_. ]/gi, '_').substring(0, 100);
 }
 
-// JioSaavn encripta URLs con DES-ECB, key = "38346591"
-// La URL resultante termina en _96.mp4 (96kbps) → la subimos a _320.mp4
-function decryptJioSaavnUrl(encrypted) {
-  if (!encrypted) return null;
-  try {
-    const key = Buffer.from('38346591');
-    const decipher = crypto.createDecipheriv('des-ecb', key, null);
-    decipher.setAutoPadding(true);
-    const data = Buffer.from(encrypted, 'base64');
-    const decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
-    return decrypted.toString('utf8')
-      .replace('http://', 'https://')
-      .replace('_96.mp4', '_320.mp4'); // máxima calidad disponible
-  } catch (e) {
-    console.warn('[DES decrypt] failed:', e.message);
-    return null;
-  }
-}
-
-// Intenta obtener la mejor URL de stream de una canción de los resultados de la API
-function extractStreamUrl(song) {
-  // Opción 1: downloadUrl directo (algunas APIs lo incluyen)
-  if (Array.isArray(song.downloadUrl) && song.downloadUrl.length > 0) {
-    const url = [...song.downloadUrl].reverse().find(u => u?.url)?.url;
-    if (url) return url;
-  }
-  // Opción 2: media_preview_url o similar directo
-  if (song.media_preview_url && song.media_preview_url.startsWith('http')) {
-    return song.media_preview_url.replace('_96.mp4', '_320.mp4').replace('http://', 'https://');
-  }
-  // Opción 3: encrypted_media_url → desencriptar
-  const enc = song.encrypted_media_url || song.more_info?.encrypted_media_url;
-  if (enc) return decryptJioSaavnUrl(enc);
-
-  return null;
-}
-
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
-
-async function fetchJSON(url, timeoutMs = 12000) {
+async function fetchJSON(url, opts = {}) {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  const t = setTimeout(() => ctrl.abort(), opts.timeout || 12000);
   try {
     const r = await fetch(url, {
       signal: ctrl.signal,
-      headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        ...(opts.headers || {}),
+      },
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    if (!r.ok) throw new Error(`HTTP ${r.status} — ${url}`);
     return await r.json();
   } finally { clearTimeout(t); }
 }
 
-// ─── JioSaavn endpoints ───────────────────────────────────────────────────────
-const JSV_ENDPOINTS = [
-  {
-    name: 'jiosaavn-api-2',
-    // Este endpoint devuelve more_info.encrypted_media_url en los resultados
-    searchUrl: (q, limit) =>
-      `https://jiosaavn-api-2.vercel.app/search/songs?query=${encodeURIComponent(q)}&page=1&limit=${limit}`,
-    songUrl: (id) =>
-      `https://jiosaavn-api-2.vercel.app/songs?id=${encodeURIComponent(id)}`,
-    parseSearch: (data) => {
-      const items = data?.data?.results || data?.results || [];
-      return items.map(s => {
-        const rawId = s.id || s.songid;
-        return {
-          id: `jsv_${rawId}`,
-          rawId,
-          title: s.title || s.name || '',
-          artist: s.more_info?.singers || s.subtitle || (s.artists?.primary||[]).map(a=>a.name).join(', ') || '',
-          duration: parseInt(s.more_info?.duration || s.duration) || 0,
-          durationStr: fmt(parseInt(s.more_info?.duration || s.duration) || 0),
-          thumbnail: s.image?.replace('150x150', '500x500') || '',
-          source: 'jiosaavn',
-          streamUrl: extractStreamUrl({ ...s, ...s.more_info }),
-        };
-      });
-    },
-    parseStream: (data) => {
-      const song = Array.isArray(data) ? data[0] : (data?.data?.[0] || data?.[0] || data);
-      return extractStreamUrl({ ...song, ...song?.more_info });
-    },
-  },
-  {
-    name: 'saavn.dev',
-    searchUrl: (q, limit) =>
-      `https://saavn.dev/api/search/songs?query=${encodeURIComponent(q)}&page=1&limit=${limit}`,
-    songUrl: (id) =>
-      `https://saavn.dev/api/songs/${id}`,
-    parseSearch: (data) => {
-      const items = data?.data?.results || [];
-      return items.map(s => ({
-        id: `jsv_${s.id}`,
-        rawId: s.id,
-        title: s.name || '',
-        artist: (s.artists?.primary || []).map(a => a.name).join(', ') || '',
-        duration: s.duration || 0,
-        durationStr: fmt(s.duration),
-        thumbnail: s.image?.[2]?.url || s.image?.[1]?.url || '',
-        source: 'jiosaavn',
-        streamUrl: extractStreamUrl(s),
-      }));
-    },
-    parseStream: (data) => {
-      const song = data?.data?.[0];
-      return extractStreamUrl(song || {});
-    },
-  },
-  {
-    name: 'jiosaavn-api-privatecvc2',
-    searchUrl: (q, limit) =>
-      `https://jiosaavn-api-privatecvc2.vercel.app/api/search/songs?query=${encodeURIComponent(q)}&page=1&limit=${limit}`,
-    songUrl: (id) =>
-      `https://jiosaavn-api-privatecvc2.vercel.app/api/songs/${id}`,
-    parseSearch: (data) => {
-      const items = data?.data?.results || [];
-      return items.map(s => ({
-        id: `jsv_${s.id}`,
-        rawId: s.id,
-        title: s.name || '',
-        artist: (s.artists?.primary || []).map(a => a.name).join(', ') || '',
-        duration: s.duration || 0,
-        durationStr: fmt(s.duration),
-        thumbnail: s.image?.[2]?.url || s.image?.[1]?.url || '',
-        source: 'jiosaavn',
-        streamUrl: extractStreamUrl(s),
-      }));
-    },
-    parseStream: (data) => {
-      const song = data?.data?.[0];
-      return extractStreamUrl(song || {});
-    },
-  },
-];
+// ─── SoundCloud client_id ─────────────────────────────────────────────────────
+// SoundCloud no requiere registro — el client_id se extrae dinámicamente
+// de sus propios scripts públicos. Se rota cada semanas pero se obtiene solo.
+let scClientId = null;
+let scClientIdFetchedAt = 0;
 
-async function jiosaavnSearch(q, limit = 15) {
-  for (const ep of JSV_ENDPOINTS) {
-    try {
-      const data = await fetchJSON(ep.searchUrl(q, limit));
-      const results = ep.parseSearch(data).filter(s => s.id && s.title);
-      if (results.length > 0) {
-        const withUrl = results.filter(s => s.streamUrl).length;
-        console.log(`[Search] ✓ ${ep.name}: ${results.length} canciones, ${withUrl} con streamUrl`);
-        return results;
-      }
-    } catch (e) {
-      console.warn(`[Search] ✗ ${ep.name}:`, e.message);
+async function getSCClientId() {
+  const CACHE_MS = 60 * 60 * 1000; // re-fetch cada 1h
+  if (scClientId && Date.now() - scClientIdFetchedAt < CACHE_MS) return scClientId;
+
+  console.log('[SC] Obteniendo client_id...');
+  try {
+    const html = await (await fetch('https://soundcloud.com', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' },
+    })).text();
+
+    // Encuentra las URLs de los scripts del bundle
+    const scriptUrls = [...html.matchAll(/https:\/\/a-v2\.sndcdn\.com\/assets\/[^"]+\.js/g)]
+      .map(m => m[0]);
+
+    for (const scriptUrl of scriptUrls.slice(-5)) {
+      try {
+        const js = await (await fetch(scriptUrl)).text();
+        const match = js.match(/client_id\s*:\s*"([a-zA-Z0-9]{32})"/);
+        if (match) {
+          scClientId = match[1];
+          scClientIdFetchedAt = Date.now();
+          console.log('[SC] client_id ok:', scClientId.substring(0, 8) + '...');
+          return scClientId;
+        }
+      } catch (_) {}
     }
+    throw new Error('client_id no encontrado en scripts');
+  } catch (e) {
+    console.error('[SC] Error obteniendo client_id:', e.message);
+    throw e;
   }
-  return [];
 }
 
-async function jiosaavnStreamUrl(trackId) {
-  // Intenta los endpoints con song detail
-  for (const ep of JSV_ENDPOINTS) {
-    try {
-      const rawId = trackId.replace('jsv_', '');
-      const data = await fetchJSON(ep.songUrl(rawId));
-      const url = ep.parseStream(data);
-      if (url) {
-        console.log(`[StreamURL] ✓ ${ep.name}: ${url.substring(0, 50)}...`);
-        return url;
-      }
-    } catch (e) {
-      console.warn(`[StreamURL] ✗ ${ep.name}:`, e.message);
-    }
+// ─── SoundCloud ───────────────────────────────────────────────────────────────
+async function scSearch(q, limit = 15) {
+  const cid = await getSCClientId();
+  const data = await fetchJSON(
+    `https://api-v2.soundcloud.com/search/tracks?q=${encodeURIComponent(q)}&client_id=${cid}&limit=${limit}&app_locale=en`
+  );
+  return (data.collection || []).map(t => ({
+    id: `sc_${t.id}`,
+    title: t.title || '',
+    artist: t.user?.username || '',
+    duration: Math.floor((t.duration || 0) / 1000),
+    durationStr: fmt(Math.floor((t.duration || 0) / 1000)),
+    thumbnail: (t.artwork_url || t.user?.avatar_url || '').replace('large', 't300x300'),
+    source: 'soundcloud',
+    permalink: t.permalink_url,
+    // streamable indica si tiene stream completo disponible
+    streamable: t.streamable !== false,
+  })).filter(t => t.streamable);
+}
+
+async function scStreamUrl(trackId) {
+  const cid = await getSCClientId();
+  const rawId = trackId.replace('sc_', '');
+
+  // Obtiene los formatos de stream disponibles
+  const data = await fetchJSON(
+    `https://api-v2.soundcloud.com/tracks/${rawId}/streams?client_id=${cid}`
+  );
+
+  // Preferimos progressive (MP3 directo) sobre HLS
+  const progressive = data?.http_mp3_128_url || data?.preview_mp3_128_url;
+  if (progressive) return progressive;
+
+  // Fallback: HLS → pedir la URL de la playlist y resolver
+  const hlsTranscode = data?.hls_mp3_128_url;
+  if (hlsTranscode) {
+    const res = await fetchJSON(`${hlsTranscode}&client_id=${cid}`);
+    return res?.url || null;
   }
-  throw new Error('Ningún endpoint devolvió URL de stream');
+
+  throw new Error('SoundCloud: no stream URL disponible');
+}
+
+// ─── Deezer ───────────────────────────────────────────────────────────────────
+// Deezer API es 100% pública para búsqueda, sin registro ni key.
+// Los previews de 30s son URLs directas de MP3.
+// Para canciones completas se necesita cuenta premium (no disponible aquí),
+// así que Deezer actúa como fuente de búsqueda y fallback de preview.
+
+async function deezerSearch(q, limit = 15) {
+  const data = await fetchJSON(
+    `https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=${limit}&output=json`
+  );
+  return (data.data || []).map(t => ({
+    id: `dz_${t.id}`,
+    title: t.title || '',
+    artist: t.artist?.name || '',
+    duration: t.duration || 0,
+    durationStr: fmt(t.duration),
+    thumbnail: t.album?.cover_medium || t.album?.cover || '',
+    source: 'deezer',
+    // preview es una URL directa de MP3 de 30 segundos, siempre disponible
+    previewUrl: t.preview || null,
+    streamable: !!(t.preview),
+    isPreview: true, // avisa al frontend que son 30s
+  })).filter(t => t.streamable);
 }
 
 // ─── ffmpeg pipe ──────────────────────────────────────────────────────────────
-function pipeAudio(audioUrl, res, req) {
-  const ff = spawn(ffmpegBin, [
+function pipeAudio(audioUrl, res, req, isHls = false) {
+  const args = [
     '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
-    '-i', audioUrl, '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', '-f', 'mp3', 'pipe:1',
-  ]);
+    '-i', audioUrl,
+    '-vn', '-ar', '44100', '-ac', '2', '-b:a', '128k', '-f', 'mp3', 'pipe:1',
+  ];
+  const ff = spawn(ffmpegBin, args);
   res.setHeader('Content-Type', 'audio/mpeg');
   res.setHeader('Transfer-Encoding', 'chunked');
   res.setHeader('Cache-Control', 'no-cache');
@@ -224,61 +168,92 @@ function pipeAudio(audioUrl, res, req) {
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
-app.get('/', (_req, res) => res.json({ status: 'ok', message: 'Aletone API v8' }));
-
-// TEST de desencriptado (diagnóstico)
-app.get('/api/test-decrypt', async (_req, res) => {
-  try {
-    const data = await fetchJSON(
-      'https://jiosaavn-api-2.vercel.app/search/songs?query=arijit+singh&page=1&limit=3',
-      10000
-    );
-    const items = data?.data?.results || data?.results || [];
-    const debug = items.map(s => ({
-      title: s.title || s.name,
-      has_downloadUrl: !!(s.downloadUrl),
-      has_encrypted: !!(s.encrypted_media_url || s.more_info?.encrypted_media_url),
-      encrypted_preview: (s.encrypted_media_url || s.more_info?.encrypted_media_url || '').substring(0, 30),
-      decrypted: extractStreamUrl({ ...s, ...s.more_info }),
-      raw_keys: Object.keys(s),
-      more_info_keys: s.more_info ? Object.keys(s.more_info) : [],
-    }));
-    res.json({ items: debug, rawFirst: items[0] });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+app.get('/', async (_req, res) => {
+  let scOk = false;
+  try { await getSCClientId(); scOk = true; } catch (_) {}
+  res.json({ status: 'ok', message: 'Aletone API v9 — SC+Deezer', soundcloud: scOk });
 });
 
-// BÚSQUEDA
+// BÚSQUEDA — SoundCloud primero (canciones completas), Deezer de complemento
 app.get('/api/search', async (req, res) => {
-  const { q, limit = 15 } = req.query;
+  const { q, limit = 20 } = req.query;
   if (!q) return res.status(400).json({ error: 'Falta q' });
   console.log(`[Search] "${q}"`);
-  const results = await jiosaavnSearch(q, Number(limit));
-  if (results.length > 0) return res.json({ results, source: 'jiosaavn' });
-  res.status(503).json({ error: 'JioSaavn no disponible. Intenta de nuevo.' });
+
+  const [scR, dzR] = await Promise.allSettled([
+    scSearch(q, Math.ceil(Number(limit) * 0.7)),   // ~70% SoundCloud
+    deezerSearch(q, Math.ceil(Number(limit) * 0.5)), // ~50% Deezer de relleno
+  ]);
+
+  const sc = scR.status === 'fulfilled' ? scR.value : [];
+  const dz = dzR.status === 'fulfilled' ? dzR.value : [];
+
+  if (scR.status === 'rejected') console.warn('[SC search]', scR.reason?.message);
+  if (dzR.status === 'rejected') console.warn('[DZ search]', dzR.reason?.message);
+
+  // Combina: SC primero (completas), luego Deezer para rellenar
+  const scIds = new Set(sc.map(s => s.title.toLowerCase() + s.artist.toLowerCase()));
+  const dzFiltered = dz.filter(d =>
+    !scIds.has(d.title.toLowerCase() + d.artist.toLowerCase())
+  );
+
+  const results = [...sc, ...dzFiltered].slice(0, Number(limit));
+
+  if (results.length === 0) {
+    return res.status(503).json({ error: 'Sin resultados. Verifica la conexión del servidor.' });
+  }
+
+  console.log(`[Search] SC:${sc.length} DZ:${dzFiltered.length} total:${results.length}`);
+  res.json({ results, source: sc.length > 0 ? 'soundcloud+deezer' : 'deezer' });
 });
 
-// PROXY STREAM (fallback cuando streamUrl directa falla por CORS)
-app.get('/api/stream/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  if (!videoId.startsWith('jsv_')) return res.status(400).json({ error: 'Solo IDs jsv_*' });
+// STREAM — proxy de audio para evitar CORS
+// SoundCloud y Deezer bloquean requests directas desde navegador en algunos casos
+app.get('/api/stream/:trackId', async (req, res) => {
+  const { trackId } = req.params;
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache');
+
   try {
-    const audioUrl = await jiosaavnStreamUrl(videoId);
+    let audioUrl;
+
+    if (trackId.startsWith('sc_')) {
+      audioUrl = await scStreamUrl(trackId);
+      console.log('[Stream] SoundCloud ok');
+    } else if (trackId.startsWith('dz_')) {
+      // Deezer: stream el preview de 30s
+      const rawId = trackId.replace('dz_', '');
+      const data = await fetchJSON(`https://api.deezer.com/track/${rawId}`);
+      audioUrl = data?.preview;
+      if (!audioUrl) throw new Error('Deezer: sin preview URL');
+      console.log('[Stream] Deezer preview ok');
+    } else {
+      return res.status(400).json({ error: 'ID inválido. Usa sc_ o dz_' });
+    }
+
     pipeAudio(audioUrl, res, req);
   } catch (e) {
+    console.error('[Stream] Error:', e.message);
     if (!res.headersSent) res.status(503).json({ error: e.message });
   }
 });
 
-// STREAM-URL (URL fresca cuando la del search expiró)
-app.get('/api/stream-url/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  if (!videoId.startsWith('jsv_')) return res.status(400).json({ error: 'Solo IDs jsv_*' });
+// STREAM-URL — devuelve la URL directa (el cliente la usa sin pasar por el servidor)
+app.get('/api/stream-url/:trackId', async (req, res) => {
+  const { trackId } = req.params;
   res.setHeader('Access-Control-Allow-Origin', '*');
+
   try {
-    const url = await jiosaavnStreamUrl(videoId);
+    let url;
+    if (trackId.startsWith('sc_')) {
+      url = await scStreamUrl(trackId);
+    } else if (trackId.startsWith('dz_')) {
+      const data = await fetchJSON(`https://api.deezer.com/track/${trackId.replace('dz_', '')}`);
+      url = data?.preview;
+    } else {
+      return res.status(400).json({ error: 'ID inválido' });
+    }
+    if (!url) throw new Error('Sin URL disponible');
     res.json({ url });
   } catch (e) {
     res.status(503).json({ error: e.message });
@@ -287,23 +262,21 @@ app.get('/api/stream-url/:videoId', async (req, res) => {
 
 // HEALTH
 app.get('/api/health', async (_req, res) => {
-  const results = await Promise.allSettled(JSV_ENDPOINTS.map(async ep => {
-    const t = Date.now();
-    try {
-      const data = await fetchJSON(ep.searchUrl('arijit singh', 3), 8000);
-      const items = ep.parseSearch(data).filter(s => s.id && s.title);
-      return { name: ep.name, ok: true, ms: Date.now()-t, songs: items.length, withStreamUrl: items.filter(s=>s.streamUrl).length };
-    } catch (e) {
-      return { name: ep.name, ok: false, ms: Date.now()-t, error: e.message };
-    }
-  }));
-  res.json({ endpoints: results.map(r => r.value || r.reason), ts: new Date().toISOString() });
+  const [sc, dz] = await Promise.allSettled([
+    getSCClientId().then(id => ({ ok: true, clientId: id.substring(0, 8) + '...' })),
+    fetchJSON('https://api.deezer.com/search?q=test&limit=1').then(d => ({ ok: true, results: d.data?.length })),
+  ]);
+  res.json({
+    soundcloud: sc.status === 'fulfilled' ? sc.value : { ok: false, error: sc.reason?.message },
+    deezer: dz.status === 'fulfilled' ? dz.value : { ok: false, error: dz.reason?.message },
+    ts: new Date().toISOString(),
+  });
 });
 
 // DOWNLOAD
 app.post('/api/download', async (req, res) => {
   const { videoId, title, streamUrl: directUrl } = req.body;
-  if (!videoId?.startsWith('jsv_')) return res.status(400).json({ error: 'Solo JioSaavn' });
+  if (!videoId) return res.status(400).json({ error: 'Falta videoId' });
 
   const filename = sanitize(title || videoId) + '.mp3';
   const filepath = path.join(DOWNLOADS_DIR, filename);
@@ -311,7 +284,16 @@ app.post('/api/download', async (req, res) => {
     return res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
 
   try {
-    const audioUrl = directUrl || await jiosaavnStreamUrl(videoId);
+    let audioUrl = directUrl;
+    if (!audioUrl) {
+      if (videoId.startsWith('sc_')) audioUrl = await scStreamUrl(videoId);
+      else if (videoId.startsWith('dz_')) {
+        const data = await fetchJSON(`https://api.deezer.com/track/${videoId.replace('dz_', '')}`);
+        audioUrl = data?.preview;
+      }
+    }
+    if (!audioUrl) throw new Error('Sin URL de audio');
+
     await new Promise((resolve, reject) => {
       const ff = spawn(ffmpegBin, [
         '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5',
@@ -337,4 +319,7 @@ setInterval(() => {
   } catch (_) {}
 }, 3600000);
 
-app.listen(PORT, () => console.log(`Aletone API v8 en puerto ${PORT}`));
+// Precarga el client_id de SoundCloud al iniciar
+getSCClientId().catch(e => console.warn('[SC] Precarga client_id falló:', e.message));
+
+app.listen(PORT, () => console.log(`Aletone API v9 — SoundCloud + Deezer en puerto ${PORT}`));
