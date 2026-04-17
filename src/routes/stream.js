@@ -9,7 +9,6 @@ const { sanitize } = require('../utils/helpers');
 const DOWNLOADS_DIR = path.join(__dirname, '../../downloads');
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
-// Limpieza de archivos con más de 24h
 setInterval(() => {
   try {
     const now = Date.now();
@@ -26,20 +25,9 @@ async function resolveAudioUrl(trackId) {
   throw new Error('ID inválido. Usa prefijo sc_ o dz_');
 }
 
-// GET /api/stream/:trackId — proxy de audio en tiempo real
-router.get('/:trackId', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-cache');
-  try {
-    const audioUrl = await resolveAudioUrl(req.params.trackId);
-    pipeAudio(audioUrl, res, req);
-  } catch (e) {
-    console.error('[stream]', e.message);
-    if (!res.headersSent) res.status(503).json({ error: e.message });
-  }
-});
+// ✅ 1. PRIMERO: rutas específicas con prefijo fijo
 
-// GET /api/stream-url/:trackId — devuelve la URL directa sin hacer proxy
+// GET /api/stream/url/:trackId — devuelve la URL directa sin proxy
 router.get('/url/:trackId', async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   try {
@@ -50,7 +38,7 @@ router.get('/url/:trackId', async (req, res) => {
   }
 });
 
-// POST /api/stream/download — descarga y guarda como MP3
+// POST /api/stream/download
 router.post('/download', async (req, res) => {
   const { videoId, title, streamUrl: directUrl } = req.body;
   if (!videoId) return res.status(400).json({ error: 'Falta videoId' });
@@ -67,6 +55,19 @@ router.post('/download', async (req, res) => {
     res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
   } catch (err) {
     res.status(500).json({ error: 'Download failed', detail: String(err).substring(0, 200) });
+  }
+});
+
+// ✅ 2. AL FINAL: la ruta genérica /:trackId (proxy de audio)
+router.get('/:trackId', async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-cache');
+  try {
+    const audioUrl = await resolveAudioUrl(req.params.trackId);
+    pipeAudio(audioUrl, res, req);
+  } catch (e) {
+    console.error('[stream]', e.message);
+    if (!res.headersSent) res.status(503).json({ error: e.message });
   }
 });
 
