@@ -12,17 +12,15 @@ app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
 function getAllowedOrigins() {
-  const configured = String(process.env.CORS_ORIGINS || '')
+  return String(process.env.CORS_ORIGINS || '')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
-  return configured;
 }
 
 const allowedOrigins = getAllowedOrigins();
 const corsOptions = {
   origin(origin, callback) {
-    // Apps instaladas, curl y health checks pueden no enviar Origin.
     if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
       callback(null, true);
       return;
@@ -55,17 +53,16 @@ app.use('/downloads', express.static(path.join(__dirname, 'downloads'), {
   },
 }));
 
-// ─── Rutas ─────────────────────────────────────────────────────────────────
 app.use('/api/auth',            require('./src/routes/auth'));
 app.use('/api/playlists',       require('./src/routes/playlists'));
 app.use('/api/history',         require('./src/routes/history'));
 app.use('/api/recommendations', require('./src/routes/recommendations'));
 app.use('/api/search',          require('./src/routes/search'));
 app.use('/api/stream',          require('./src/routes/stream'));
+app.use('/api/devices',         require('./src/routes/devices'));
 
-// ─── Health ────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', service: 'aletone-api', version: '11' });
+  res.json({ status: 'ok', service: 'aletone-api', version: '12', connect: true });
 });
 
 app.get('/api/health', async (_req, res) => {
@@ -79,6 +76,8 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
+    version: '12',
+    connect: true,
     soundcloud: sc.status === 'fulfilled' ? sc.value : { ok: false, error: sc.reason?.message },
     deezer: dz.status === 'fulfilled' ? dz.value : { ok: false, error: dz.reason?.message },
     database: dbCheck.status === 'fulfilled' ? dbCheck.value : { ok: false, error: dbCheck.reason?.message },
@@ -88,9 +87,7 @@ app.get('/api/health', async (_req, res) => {
 
 app.use((err, _req, res, next) => {
   if (res.headersSent) return next(err);
-  if (err?.message === 'Origen no permitido por CORS') {
-    return res.status(403).json({ error: 'Origen no permitido' });
-  }
+  if (err?.message === 'Origen no permitido por CORS') return res.status(403).json({ error: 'Origen no permitido' });
   console.error('[HTTP]', err);
   return res.status(500).json({ error: 'Error interno del servidor' });
 });
@@ -99,7 +96,7 @@ let server;
 initDB()
   .then(() => getSCClientId().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
-    server = app.listen(PORT, () => console.log(`Aletone API v11 corriendo en puerto ${PORT}`));
+    server = app.listen(PORT, () => console.log(`Aletone API v12 corriendo en puerto ${PORT}`));
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
   })
