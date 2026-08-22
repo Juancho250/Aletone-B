@@ -5,6 +5,7 @@ const { scSearch } = require('../services/soundcloud');
 const memoryCache = new Map();
 const CACHE_TTL_MS = 90_000;
 const DB_FAST_HIT = 8;
+const CATALOG_VERSION = 'sc-playable-v2';
 
 function normalizeQuery(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 120);
@@ -12,6 +13,8 @@ function normalizeQuery(value) {
 
 function fromDb(row) {
   const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+  const verified = metadata.catalogVersion === CATALOG_VERSION && metadata.streamVerified === true;
+
   return {
     id: row.id,
     externalId: row.external_id || metadata.externalId || '',
@@ -28,16 +31,20 @@ function fromDb(row) {
     playbackCount: Number(metadata.playbackCount || 0),
     likesCount: Number(metadata.likesCount || 0),
     repostsCount: Number(metadata.repostsCount || 0),
-    access: 'playable',
-    streamable: true,
-    fullStream: true,
+    access: metadata.access || 'playable',
+    streamable: verified,
+    fullStream: verified,
+    streamVerified: verified,
     isPreview: false,
+    providerMode: metadata.providerMode || 'unknown',
   };
 }
 
 async function saveTracks(tracks) {
-  if (!tracks?.length) return;
-  await Promise.allSettled(tracks.map(track => db.query(
+  const verifiedTracks = (tracks || []).filter(track => track?.fullStream && track?.streamVerified !== false);
+  if (!verifiedTracks.length) return;
+
+  await Promise.allSettled(verifiedTracks.map(track => db.query(
     `INSERT INTO tracks (
        id, source, external_id, title, artist, album, thumbnail, duration, metadata, updated_at
      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NOW())
@@ -68,7 +75,11 @@ async function saveTracks(tracks) {
         playbackCount: track.playbackCount || 0,
         likesCount: track.likesCount || 0,
         repostsCount: track.repostsCount || 0,
+        access: track.access || 'playable',
+        providerMode: track.providerMode || 'unknown',
         fullStream: true,
+        streamVerified: true,
+        catalogVersion: CATALOG_VERSION,
       }),
     ]
   )));
@@ -80,6 +91,8 @@ async function localSearch(q, limit) {
     `SELECT id, source, external_id, title, artist, album, thumbnail, duration, metadata
      FROM tracks
      WHERE source = 'soundcloud'
+       AND metadata->>'catalogVersion' = $2
+       AND metadata->>'streamVerified' = 'true'
        AND (
          LOWER(title) LIKE $1 OR
          LOWER(COALESCE(artist, '')) LIKE $1 OR
@@ -87,26 +100,29 @@ async function localSearch(q, limit) {
        )
      ORDER BY
        CASE
-         WHEN LOWER(title) = LOWER($2) THEN 0
-         WHEN LOWER(COALESCE(artist, '')) = LOWER($2) THEN 1
-         WHEN LOWER(title) LIKE LOWER($2) || '%' THEN 2
+         WHEN LOWER(title) = LOWER($3) THEN 0
+         WHEN LOWER(COALESCE(artist, '')) = LOWER($3) THEN 1
+         WHEN LOWER(title) LIKE LOWER($3) || '%' THEN 2
          ELSE 3
        END,
        updated_at DESC
-     LIMIT $3`,
-    [pattern, q, limit]
+     LIMIT $4`,
+    [pattern, CATALOG_VERSION, q, limit]
   );
-  return rows.map(fromDb);
+  return rows.map(fromDb).filter(track => track.fullStream);
 }
 
 async function providerSearch(q, limit) {
-  const tracks = await scSearch(q, Math.min(Math.max(limit + 8, 15), 40));
+  // En modo público hay mucho contenido preview entre los primeros resultados.
+  // Pedimos una ventana más amplia y solo conservamos pistas verificadas como full.
+  const candidateLimit = Math.min(Math.max(limit * 3, 30), 50);
+  const tracks = await scSearch(q, candidateLimit);
   const deduped = [];
   const seen = new Set();
 
   for (const track of tracks) {
     const key = `${track.title}`.trim().toLowerCase() + '|' + `${track.artist}`.trim().toLowerCase();
-    if (!track.fullStream || seen.has(key)) continue;
+    if (!track.fullStream || track.streamVerified === false || seen.has(key)) continue;
     seen.add(key);
     deduped.push(track);
     if (deduped.length >= limit) break;
@@ -129,8 +145,6 @@ router.get('/', async (req, res) => {
   }
 
   try {
-    // Tracks que Aletone ya conoce salen desde Neon en milisegundos. En paralelo
-    // renovamos el catálogo sin bloquear al usuario.
     const local = await localSearch(q, limit);
     if (local.length >= Math.min(DB_FAST_HIT, limit)) {
       providerSearch(q, limit).catch(error => console.warn('[Search refresh]', error.message));
@@ -144,7 +158,7 @@ router.get('/', async (req, res) => {
     const results = await providerSearch(q, limit);
     if (!results.length) {
       return res.status(404).json({
-        error: 'No encontramos una versión completa reproducible de esta búsqueda.',
+        error: 'SoundCloud no devolvió versiones completas reproducibles fuera de su plataforma para esta búsqueda.',
       });
     }
     console.log(`[Search] "${q}" full:${results.length}`);
