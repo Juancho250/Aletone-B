@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const router = require('express').Router();
-const { scStreamUrl } = require('../services/soundcloud');
+const { scStreamInfo } = require('../services/soundcloud');
 const { deezerTrackUrl } = require('../services/deezer');
 const { pipeAudio, downloadAudio } = require('../services/ffmpeg');
 const { sanitize } = require('../utils/helpers');
@@ -35,10 +35,25 @@ function cleanOldDownloads() {
   }
 }
 
-async function resolveAudioUrl(trackId) {
+async function resolveAudioSource(trackId) {
   assertTrackId(trackId);
-  if (trackId.startsWith('sc_')) return scStreamUrl(trackId);
-  return deezerTrackUrl(trackId);
+
+  if (trackId.startsWith('sc_')) {
+    const info = await scStreamInfo(trackId);
+    return { ...info, source: 'soundcloud' };
+  }
+
+  // La API pública de Deezer solo entrega previews. Se conserva soporte para
+  // elementos históricos, pero nunca se presenta como canción completa.
+  const url = await deezerTrackUrl(trackId);
+  return {
+    url,
+    source: 'deezer',
+    protocol: 'progressive',
+    mimeType: 'audio/mpeg',
+    proxyRequired: false,
+    isPreview: true,
+  };
 }
 
 function buildDownloadName(trackId, title) {
@@ -47,20 +62,28 @@ function buildDownloadName(trackId, title) {
   return `${safeTitle}-${safeId}.mp3`;
 }
 
-// Devuelve una URL efímera resuelta por el servidor. Nunca acepta URLs arbitrarias
-// del cliente: evita que este endpoint se convierta en un proxy hacia hosts internos.
+// Resuelve la mejor estrategia de reproducción. Para AAC/HLS SoundCloud el
+// navegador de escritorio no siempre puede reproducir m3u8 directamente, así
+// que indicamos al cliente que use el proxy/transcodificador de Aletone.
 router.get('/url/:trackId', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   try {
-    const url = await resolveAudioUrl(req.params.trackId);
-    return res.json({ url });
+    const trackId = assertTrackId(req.params.trackId);
+    const audio = await resolveAudioSource(trackId);
+
+    return res.json({
+      url: audio.proxyRequired ? `/api/stream/${encodeURIComponent(trackId)}` : audio.url,
+      mode: audio.proxyRequired ? 'proxy' : 'direct',
+      source: audio.source,
+      isPreview: Boolean(audio.isPreview),
+      mimeType: audio.mimeType || null,
+      protocol: audio.protocol || null,
+    });
   } catch (error) {
     return res.status(error.status || 503).json({ error: error.message });
   }
 });
 
-// Genera una copia temporal para que el frontend pueda guardarla en IndexedDB.
-// La reproducción offline final ocurre en el dispositivo del usuario.
 router.post('/download', async (req, res) => {
   const { videoId, title } = req.body || {};
 
@@ -78,8 +101,14 @@ router.post('/download', async (req, res) => {
       });
     }
 
-    const audioUrl = await resolveAudioUrl(videoId);
-    await downloadAudio(audioUrl, filepath);
+    const audio = await resolveAudioSource(videoId);
+    if (audio.isPreview) {
+      return res.status(409).json({
+        error: 'Esta fuente solo ofrece un preview y no puede guardarse como canción offline.',
+      });
+    }
+
+    await downloadAudio(audio.url, filepath);
 
     return res.json({
       success: true,
@@ -95,12 +124,11 @@ router.post('/download', async (req, res) => {
   }
 });
 
-// Proxy de audio para navegadores/proveedores donde la URL directa no funciona.
 router.get('/:trackId', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   try {
-    const audioUrl = await resolveAudioUrl(req.params.trackId);
-    return pipeAudio(audioUrl, res, req);
+    const audio = await resolveAudioSource(req.params.trackId);
+    return pipeAudio(audio.url, res, req);
   } catch (error) {
     console.error('[stream]', error.message);
     if (!res.headersSent) return res.status(error.status || 503).json({ error: error.message });
