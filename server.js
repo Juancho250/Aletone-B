@@ -57,12 +57,13 @@ app.use('/api/auth',            require('./src/routes/auth'));
 app.use('/api/playlists',       require('./src/routes/playlists'));
 app.use('/api/history',         require('./src/routes/history'));
 app.use('/api/recommendations', require('./src/routes/recommendations'));
+app.use('/api/saved',           require('./src/routes/saved'));
 app.use('/api/search',          require('./src/routes/search'));
 app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
 
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', service: 'aletone-api', version: '12', connect: true });
+  res.json({ status: 'ok', service: 'aletone-api', version: '13', connect: true, tasteGraph: 'v1' });
 });
 
 app.get('/api/health', async (_req, res) => {
@@ -76,8 +77,9 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '12',
+    version: '13',
     connect: true,
+    tasteGraph: 'v1',
     soundcloud: sc.status === 'fulfilled' ? sc.value : { ok: false, error: sc.reason?.message },
     deezer: dz.status === 'fulfilled' ? dz.value : { ok: false, error: dz.reason?.message },
     database: dbCheck.status === 'fulfilled' ? dbCheck.value : { ok: false, error: dbCheck.reason?.message },
@@ -96,7 +98,7 @@ let server;
 initDB()
   .then(() => getSCClientId().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
-    server = app.listen(PORT, () => console.log(`Aletone API v12 corriendo en puerto ${PORT}`));
+    server = app.listen(PORT, () => console.log(`Aletone API v13 corriendo en puerto ${PORT}`));
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
   })
