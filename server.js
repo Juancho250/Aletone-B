@@ -3,7 +3,7 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const { initDB } = require('./src/config/db');
-const { getSCClientId } = require('./src/services/soundcloud');
+const { warmSoundCloud, soundCloudMode } = require('./src/services/soundcloud');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -63,24 +63,33 @@ app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
 
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', service: 'aletone-api', version: '13', connect: true, tasteGraph: 'v1' });
+  res.json({
+    status: 'ok',
+    service: 'aletone-api',
+    version: '14',
+    connect: true,
+    tasteGraph: 'v1',
+    soundcloudMode: soundCloudMode(),
+  });
 });
 
 app.get('/api/health', async (_req, res) => {
   const { db } = require('./src/config/db');
   const { fetchJSON } = require('./src/utils/helpers');
   const [sc, dz, dbCheck] = await Promise.allSettled([
-    getSCClientId().then(id => ({ ok: true, clientId: `${id.substring(0, 8)}...` })),
+    warmSoundCloud(),
     fetchJSON('https://api.deezer.com/search?q=test&limit=1').then(data => ({ ok: true, results: data.data?.length || 0 })),
     db.one('SELECT COUNT(*)::int AS n FROM users').then(row => ({ ok: true, users: row?.n || 0 })),
   ]);
 
   res.json({
     ok: true,
-    version: '13',
+    version: '14',
     connect: true,
     tasteGraph: 'v1',
-    soundcloud: sc.status === 'fulfilled' ? sc.value : { ok: false, error: sc.reason?.message },
+    soundcloud: sc.status === 'fulfilled'
+      ? sc.value
+      : { ok: false, mode: soundCloudMode(), error: sc.reason?.message },
     deezer: dz.status === 'fulfilled' ? dz.value : { ok: false, error: dz.reason?.message },
     database: dbCheck.status === 'fulfilled' ? dbCheck.value : { ok: false, error: dbCheck.reason?.message },
     ts: new Date().toISOString(),
@@ -96,9 +105,11 @@ app.use((err, _req, res, next) => {
 
 let server;
 initDB()
-  .then(() => getSCClientId().catch(error => console.warn('[SC] Precarga falló:', error.message)))
+  .then(() => warmSoundCloud().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
-    server = app.listen(PORT, () => console.log(`Aletone API v13 corriendo en puerto ${PORT}`));
+    server = app.listen(PORT, () => {
+      console.log(`Aletone API v14 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
+    });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
   })
