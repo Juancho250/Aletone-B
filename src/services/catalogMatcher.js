@@ -1,6 +1,10 @@
 const { searchTracks: audiusSearchTracks } = require('../providers/audius');
 const { searchCatalog } = require('../providers/deezerCatalog');
-const { searchVideos: youtubeSearchVideos, configured: youtubeConfigured } = require('../providers/youtube');
+const {
+  searchVideos: youtubeSearchVideos,
+  searchArtistCatalog: youtubeSearchArtistCatalog,
+  configured: youtubeConfigured,
+} = require('../providers/youtube');
 const { scSearch } = require('./soundcloud');
 const { resolveSoundCloudStream } = require('./streamResolver');
 
@@ -128,9 +132,9 @@ function detectArtistMode(query, canonicalTracks) {
     names.set(artist, track.artist);
   }
   const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-  const exact = ranked.find(([artist]) => artist === q || similarity(artist, q) >= 0.94);
+  const exact = ranked.find(([artist]) => artist === q || similarity(artist, q) >= 0.96);
   if (exact && exact[1] >= 2) return names.get(exact[0]);
-  if (ranked[0] && ranked[0][1] >= 4 && similarity(ranked[0][0], q) >= 0.82) return names.get(ranked[0][0]);
+  if (ranked[0] && ranked[0][1] >= 5 && similarity(ranked[0][0], q) >= 0.90) return names.get(ranked[0][0]);
   return '';
 }
 
@@ -143,10 +147,11 @@ function catalogRelevance(track, query, artistMode = '') {
   const artistSim = similarity(artist, q);
   const albumSim = similarity(album, q);
   const rank = Math.max(0, Number(track.rank || 0));
-  let score = titleSim * 260 + artistSim * 300 + albumSim * 70 + Math.log10(rank + 1) * 12;
-  if (title === q) score += 180;
-  if (artist === q) score += 260;
-  if (artistMode && similarity(track.artist, artistMode) >= 0.94) score += 180;
+  let score = titleSim * 320 + artistSim * 300 + albumSim * 60 + Math.log10(rank + 1) * 10;
+  if (title === q) score += 320;
+  else if (title.startsWith(q) || q.startsWith(title)) score += 120;
+  if (artist === q) score += 320;
+  if (artistMode && similarity(track.artist, artistMode) >= 0.96) score += 220;
   return score;
 }
 
@@ -172,17 +177,19 @@ function candidateAccepted(track, canonical, provider, query) {
   const match = canonicalMatch(track, [canonical]);
   if (!match) return null;
 
-  const maxDurationDelta = provider === 'soundcloud' ? 18 : provider === 'youtube' ? 28 : 24;
-  const minScore = provider === 'soundcloud' ? 0.88 : provider === 'youtube' ? 0.80 : 0.82;
-  const minArtist = provider === 'soundcloud' ? 0.86 : provider === 'youtube' ? 0.78 : 0.80;
+  const maxDurationDelta = provider === 'soundcloud' ? 18 : provider === 'youtube' ? 30 : 24;
+  const minScore = provider === 'soundcloud' ? 0.88 : provider === 'youtube' ? 0.79 : 0.82;
+  const minArtist = provider === 'soundcloud' ? 0.86 : provider === 'youtube' ? 0.76 : 0.80;
   const minTitle = provider === 'soundcloud' ? 0.86 : provider === 'youtube' ? 0.82 : 0.82;
   if (match.score < minScore || match.artistSim < minArtist || match.titleSim < minTitle || match.durationDelta > maxDurationDelta) return null;
 
   let score = match.score * 300;
   if (track.verifiedUser) score += 30;
   if (provider === 'audius') score += 28;
-  if (provider === 'youtube') score += 18;
+  if (provider === 'youtube') score += 24;
   if (match.artistMention) score += 18;
+  if (/\btopic\b/i.test(String(track.uploader || ''))) score += 35;
+  if (/vevo|official/i.test(String(track.uploader || ''))) score += 24;
   score += Math.min(35, Math.log10(Number(track.playbackCount || 0) + 1) * 5);
   score += Math.min(15, Math.log10(Number(track.likesCount || 0) + 1) * 2.5);
   if (fold(cleanTitle(track.title, canonical.artist)) === fold(canonical.titleShort || canonical.title)) score += 35;
@@ -243,9 +250,11 @@ async function mapWithConcurrencyOrdered(items, concurrency, worker) {
 
 async function resolveCanonicalTrack(canonical, provider, query) {
   const exact = `${canonical.artist} ${canonical.titleShort || canonical.title}`;
-  const candidates = provider === 'audius'
-    ? await audiusSearchTracks(exact, 10).catch(() => [])
-    : await scSearch(exact, 10).catch(() => []);
+  let candidates = [];
+  if (provider === 'audius') candidates = await audiusSearchTracks(exact, 10).catch(() => []);
+  else if (provider === 'youtube') candidates = await youtubeSearchVideos(exact, 8).catch(() => []);
+  else candidates = await scSearch(exact, 10).catch(() => []);
+
   const best = bestCandidate(candidates, canonical, provider, query);
   if (!best) return null;
 
@@ -290,20 +299,33 @@ function orderPlayableByCatalog(catalogTracks, matches, limit) {
   return output;
 }
 
+function mergeUniqueProviderTracks(...groups) {
+  const seen = new Set();
+  const output = [];
+  for (const group of groups) {
+    for (const track of group || []) {
+      if (!track?.id || seen.has(track.id)) continue;
+      seen.add(track.id);
+      output.push(track);
+    }
+  }
+  return output;
+}
+
 async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = true, quick = false } = {}) {
   const clean = String(query || '').trim().replace(/\s+/g, ' ').slice(0, 180);
   const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 40);
-  const cacheKey = `${fold(clean)}|${safeLimit}|${includeSoundCloudFallback ? 1 : 0}|${quick ? 1 : 0}|canonical-youtube-v1`;
+  const cacheKey = `${fold(clean)}|${safeLimit}|${includeSoundCloudFallback ? 1 : 0}|${quick ? 1 : 0}|canonical-youtube-v2`;
   const cached = searchCache.get(cacheKey);
   if (cached && Date.now() - cached.at < SEARCH_CACHE_MS) return { ...cached.value, cached: true };
 
   const [catalog, audiusInitial, youtubeInitial] = await Promise.all([
-    searchCatalog(clean, Math.min(50, Math.max(36, safeLimit + 14))).catch(() => ({ tracks: [], artists: [], albums: [] })),
+    searchCatalog(clean, Math.min(50, Math.max(40, safeLimit + 14))).catch(() => ({ tracks: [], artists: [], albums: [] })),
     audiusSearchTracks(clean, Math.min(50, Math.max(24, safeLimit))).catch(() => []),
-    youtubeConfigured() ? youtubeSearchVideos(clean, Math.min(30, safeLimit)).catch(() => []) : Promise.resolve([]),
+    youtubeConfigured() ? youtubeSearchVideos(clean, Math.min(50, Math.max(36, safeLimit))).catch(() => []) : Promise.resolve([]),
   ]);
 
-  const orderedCatalog = orderCatalogTracks(catalog.tracks || [], clean, Math.min(32, safeLimit));
+  const orderedCatalog = orderCatalogTracks(catalog.tracks || [], clean, Math.min(36, safeLimit));
   const catalogTracks = orderedCatalog.tracks;
   const artistMode = orderedCatalog.artistMode;
   const matches = matchBroadProviderToCatalog(audiusInitial, catalogTracks, clean, 'audius');
@@ -314,16 +336,28 @@ async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = tr
     for (const track of exactAudius) matches.set(String(track.catalogId), track);
   }
 
-  if (youtubeInitial.length && catalogTracks.length) {
-    const youtubeMatches = matchBroadProviderToCatalog(youtubeInitial, catalogTracks, clean, 'youtube');
+  let youtubeCandidates = youtubeInitial;
+  if (!quick && youtubeConfigured() && artistMode) {
+    const artistCatalog = await youtubeSearchArtistCatalog(artistMode, 50).catch(() => []);
+    youtubeCandidates = mergeUniqueProviderTracks(youtubeInitial, artistCatalog);
+  }
+
+  if (youtubeCandidates.length && catalogTracks.length) {
+    const youtubeMatches = matchBroadProviderToCatalog(youtubeCandidates, catalogTracks, clean, 'youtube');
     for (const [catalogId, candidate] of youtubeMatches) {
       if (!matches.has(catalogId)) matches.set(catalogId, candidate);
     }
   }
 
+  if (!quick && youtubeConfigured() && catalogTracks.length) {
+    const unresolvedYouTube = catalogTracks.filter(track => !matches.has(String(track.catalogId))).slice(0, 6);
+    const exactYouTube = await mapWithConcurrencyOrdered(unresolvedYouTube, 2, canonical => resolveCanonicalTrack(canonical, 'youtube', clean));
+    for (const track of exactYouTube) matches.set(String(track.catalogId), track);
+  }
+
   if (!quick && includeSoundCloudFallback && catalogTracks.length) {
-    const unresolvedSoundCloud = catalogTracks.filter(track => !matches.has(String(track.catalogId))).slice(0, 12);
-    const exactSoundCloud = await mapWithConcurrencyOrdered(unresolvedSoundCloud, 4, canonical => resolveCanonicalTrack(canonical, 'soundcloud', clean));
+    const unresolvedSoundCloud = catalogTracks.filter(track => !matches.has(String(track.catalogId))).slice(0, 8);
+    const exactSoundCloud = await mapWithConcurrencyOrdered(unresolvedSoundCloud, 3, canonical => resolveCanonicalTrack(canonical, 'soundcloud', clean));
     for (const track of exactSoundCloud) matches.set(String(track.catalogId), track);
   }
 
@@ -332,7 +366,7 @@ async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = tr
     tracks = orderPlayableByCatalog(catalogTracks, matches, safeLimit);
   } else {
     const q = fold(clean);
-    const rawCandidates = [...(audiusInitial || []), ...(youtubeInitial || [])];
+    const rawCandidates = mergeUniqueProviderTracks(audiusInitial, youtubeInitial);
     const seen = new Set();
     tracks = rawCandidates
       .filter(track => !isNoisy(track, clean))
