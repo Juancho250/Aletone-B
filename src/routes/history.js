@@ -5,7 +5,8 @@ const { cacheLyrics } = require('../services/lyrics');
 
 router.use(auth);
 
-const PLAYABLE_CATALOG_VERSION = 'sc-playable-v3';
+const UNIFIED_CATALOG_VERSION = 'aleon-unified-v1';
+const LEGACY_SC_VERSION = 'sc-playable-v3';
 
 function nonNegativeInt(value, fallback = 0) {
   const n = Number(value);
@@ -13,18 +14,28 @@ function nonNegativeInt(value, fallback = 0) {
   return Math.max(0, Math.round(n));
 }
 
+function inferSource(id, explicit) {
+  if (explicit) return String(explicit).toLowerCase();
+  if (String(id).startsWith('au_')) return 'audius';
+  if (String(id).startsWith('sc_')) return 'soundcloud';
+  if (String(id).startsWith('dz_')) return 'deezer';
+  return 'unknown';
+}
+
 async function upsertTrack(track) {
   const id = String(track.track_id || '').trim();
   if (!id) return;
 
-  const source = String(track.source || (id.startsWith('sc_') ? 'soundcloud' : id.startsWith('dz_') ? 'deezer' : 'unknown'));
+  const source = inferSource(id, track.source);
   const externalId = id.includes('_') ? id.slice(id.indexOf('_') + 1) : null;
   const duration = nonNegativeInt(track.duration, 0) || null;
+  const fullProvider = source === 'audius' || source === 'soundcloud';
 
   await db.query(
     `INSERT INTO tracks (id, source, external_id, title, artist, album, thumbnail, duration, metadata, updated_at)
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,NOW())
      ON CONFLICT (id) DO UPDATE SET
+       source = EXCLUDED.source,
        title = COALESCE(NULLIF(EXCLUDED.title,''), tracks.title),
        artist = COALESCE(NULLIF(EXCLUDED.artist,''), tracks.artist),
        album = COALESCE(NULLIF(EXCLUDED.album,''), tracks.album),
@@ -41,7 +52,13 @@ async function upsertTrack(track) {
       String(track.album || '').slice(0, 300) || null,
       String(track.thumbnail || '').slice(0, 2000) || null,
       duration,
-      JSON.stringify({ genre: track.genre || '', permalink: track.permalink || '' }),
+      JSON.stringify({
+        genre: track.genre || '',
+        permalink: track.permalink || '',
+        streamVerified: fullProvider,
+        fullStream: fullProvider,
+        catalogVersion: fullProvider ? UNIFIED_CATALOG_VERSION : null,
+      }),
     ]
   );
 }
@@ -69,14 +86,15 @@ router.post('/', async (req, res) => {
         String(title || '').slice(0, 500) || null,
         String(artist || '').slice(0, 300) || null,
         String(thumbnail || '').slice(0, 2000) || null,
-        String(source || '').slice(0, 40) || null,
+        inferSource(track_id, source).slice(0, 40),
         Number.isSafeInteger(Number(device_id)) ? Number(device_id) : null,
         String(context_type || '').slice(0, 60) || null,
         String(context_id || '').slice(0, 220) || null,
       ]
     );
 
-    if (String(source || '').toLowerCase() === 'soundcloud' && title && artist) {
+    const normalizedSource = inferSource(track_id, source);
+    if ((normalizedSource === 'audius' || normalizedSource === 'soundcloud') && title && artist) {
       cacheLyrics({
         id: String(track_id),
         title: String(title),
@@ -149,19 +167,21 @@ router.get('/', async (req, res) => {
        LEFT JOIN tracks t ON t.id = h.track_id
        WHERE h.user_id = $1
          AND (
-           COALESCE(t.source, h.source) <> 'soundcloud'
+           COALESCE(t.source, h.source) = 'audius'
+           OR COALESCE(t.source, h.source) NOT IN ('soundcloud','deezer')
            OR (
-             t.metadata->>'catalogVersion' = $3
+             COALESCE(t.source, h.source) = 'soundcloud'
              AND t.metadata->>'streamVerified' = 'true'
+             AND t.metadata->>'catalogVersion' IN ($3,$4)
            )
          )
        ORDER BY h.track_id, h.played_at DESC
      ) recent
      ORDER BY last_played DESC
      LIMIT $2`,
-    [req.user.id, limit, PLAYABLE_CATALOG_VERSION]
+    [req.user.id, limit, UNIFIED_CATALOG_VERSION, LEGACY_SC_VERSION]
   );
-  return res.json({ tracks, catalogVersion: PLAYABLE_CATALOG_VERSION });
+  return res.json({ tracks, catalogVersion: UNIFIED_CATALOG_VERSION });
 });
 
 module.exports = router;
