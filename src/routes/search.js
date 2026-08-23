@@ -1,16 +1,19 @@
 const router = require('express').Router();
 const { db } = require('../config/db');
-const { scSearch, scStreamInfo } = require('../services/soundcloud');
+const { scSearch } = require('../services/soundcloud');
+const { resolveSoundCloudStream } = require('../services/streamResolver');
 const { searchLyrics, warmLyrics } = require('../services/lyrics');
 
 const memoryCache = new Map();
+const fastCache = new Map();
 const verificationCache = new Map();
 const suggestionCache = new Map();
-const prewarmPromises = new Map();
+
 const CACHE_TTL_MS = 90_000;
+const FAST_CACHE_TTL_MS = 45_000;
 const VERIFY_TTL_MS = 10 * 60_000;
 const SUGGEST_TTL_MS = 5 * 60_000;
-const DB_FAST_HIT = 4;
+const DB_FAST_HIT = 8;
 const CATALOG_VERSION = 'sc-playable-v3';
 
 function normalizeQuery(value) {
@@ -32,21 +35,21 @@ function levenshtein(a, b) {
   if (x === y) return 0;
   if (!x) return y.length;
   if (!y) return x.length;
-  const previous = Array.from({ length: y.length + 1 }, (_, i) => i);
+  const row = Array.from({ length: y.length + 1 }, (_, index) => index);
   for (let i = 1; i <= x.length; i += 1) {
-    let diagonal = previous[0];
-    previous[0] = i;
+    let diagonal = row[0];
+    row[0] = i;
     for (let j = 1; j <= y.length; j += 1) {
-      const old = previous[j];
-      previous[j] = Math.min(
-        previous[j] + 1,
-        previous[j - 1] + 1,
+      const previous = row[j];
+      row[j] = Math.min(
+        row[j] + 1,
+        row[j - 1] + 1,
         diagonal + (x[i - 1] === y[j - 1] ? 0 : 1)
       );
-      diagonal = old;
+      diagonal = previous;
     }
   }
-  return previous[y.length];
+  return row[y.length];
 }
 
 function textSimilarity(a, b) {
@@ -57,8 +60,7 @@ function textSimilarity(a, b) {
   if (x.startsWith(y) || y.startsWith(x)) {
     return 0.88 + (Math.min(x.length, y.length) / Math.max(x.length, y.length)) * 0.12;
   }
-  const distance = levenshtein(x, y);
-  return Math.max(0, 1 - distance / Math.max(x.length, y.length));
+  return Math.max(0, 1 - levenshtein(x, y) / Math.max(x.length, y.length));
 }
 
 function fromDb(row) {
@@ -86,6 +88,7 @@ function fromDb(row) {
     streamVerified: verified,
     isPreview: false,
     providerMode: metadata.providerMode || 'unknown',
+    provisional: false,
   };
 }
 
@@ -107,21 +110,35 @@ async function saveTracks(tracks) {
        metadata = tracks.metadata || EXCLUDED.metadata,
        updated_at = NOW()`,
     [
-      track.id, track.source, track.externalId || null, track.title, track.artist || null,
-      track.album || null, track.thumbnail || null, track.duration || null,
+      track.id,
+      track.source,
+      track.externalId || null,
+      track.title,
+      track.artist || null,
+      track.album || null,
+      track.thumbnail || null,
+      track.duration || null,
       JSON.stringify({
-        durationStr: track.durationStr || '', genre: track.genre || '', permalink: track.permalink || '',
-        releaseDate: track.releaseDate || null, playbackCount: track.playbackCount || 0,
-        likesCount: track.likesCount || 0, repostsCount: track.repostsCount || 0,
-        access: track.access || 'playable', providerMode: track.providerMode || 'unknown',
-        fullStream: true, streamVerified: true, catalogVersion: CATALOG_VERSION,
+        durationStr: track.durationStr || '',
+        genre: track.genre || '',
+        permalink: track.permalink || '',
+        releaseDate: track.releaseDate || null,
+        playbackCount: track.playbackCount || 0,
+        likesCount: track.likesCount || 0,
+        repostsCount: track.repostsCount || 0,
+        access: track.access || 'playable',
+        providerMode: track.providerMode || 'unknown',
+        fullStream: true,
+        streamVerified: true,
+        catalogVersion: CATALOG_VERSION,
       }),
     ]
   )));
 }
 
 async function localSearch(q, limit) {
-  const pattern = `%${fold(q)}%`;
+  const raw = normalizeQuery(q).toLowerCase();
+  const pattern = `%${raw}%`;
   const rows = await db.all(
     `SELECT id, source, external_id, title, artist, album, thumbnail, duration, metadata
      FROM tracks
@@ -129,19 +146,21 @@ async function localSearch(q, limit) {
        AND metadata->>'catalogVersion' = $2
        AND metadata->>'streamVerified' = 'true'
        AND (
-         LOWER(title) LIKE $1 OR LOWER(COALESCE(artist, '')) LIKE $1 OR LOWER(COALESCE(album, '')) LIKE $1
+         LOWER(title) LIKE $1 OR
+         LOWER(COALESCE(artist, '')) LIKE $1 OR
+         LOWER(COALESCE(album, '')) LIKE $1
        )
      ORDER BY
        CASE
-         WHEN LOWER(title) = LOWER($3) THEN 0
-         WHEN LOWER(COALESCE(artist, '')) = LOWER($3) THEN 1
-         WHEN LOWER(title) LIKE LOWER($3) || '%' THEN 2
-         WHEN LOWER(COALESCE(artist, '')) LIKE LOWER($3) || '%' THEN 3
+         WHEN LOWER(title) = $3 THEN 0
+         WHEN LOWER(COALESCE(artist, '')) = $3 THEN 1
+         WHEN LOWER(title) LIKE $3 || '%' THEN 2
+         WHEN LOWER(COALESCE(artist, '')) LIKE $3 || '%' THEN 3
          ELSE 4
        END,
        updated_at DESC
      LIMIT $4`,
-    [pattern, CATALOG_VERSION, q, limit]
+    [pattern, CATALOG_VERSION, raw, limit]
   );
   return rows.map(fromDb).filter(track => track.fullStream);
 }
@@ -177,6 +196,7 @@ async function buildSuggestions(q) {
 
   const suggestions = [];
   const seen = new Set();
+
   try {
     const rows = await recentVocabulary();
     for (const row of rows) {
@@ -195,73 +215,38 @@ async function buildSuggestions(q) {
     }
   } catch (_) {}
 
-  try {
-    const provider = await scSearch(q, 24);
-    for (const track of provider) {
-      for (const item of [
-        { type: 'artist', value: track.artist, subtitle: 'Artista', thumbnail: track.thumbnail || '' },
-        { type: 'track', value: track.title, subtitle: track.artist || 'Canción', thumbnail: track.thumbnail || '' },
-      ]) {
-        if (!item.value) continue;
-        const key = `${item.type}|${fold(item.value)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        suggestions.push({ ...item, score: rankSuggestion(q, item.value, item.type) + 6 });
+  if (suggestions.length < 5 && normalizeQuery(q).length >= 3) {
+    try {
+      const provider = await scSearch(q, 12);
+      for (const track of provider) {
+        for (const item of [
+          { type: 'artist', value: track.artist, subtitle: 'Artista', thumbnail: track.thumbnail || '' },
+          { type: 'track', value: track.title, subtitle: track.artist || 'Canción', thumbnail: track.thumbnail || '' },
+        ]) {
+          if (!item.value) continue;
+          const key = `${item.type}|${fold(item.value)}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          suggestions.push({ ...item, score: rankSuggestion(q, item.value, item.type) + 6 });
+        }
       }
-    }
-  } catch (_) {}
+    } catch (_) {}
+  }
 
   suggestions.sort((a, b) => b.score - a.score);
-  const trimmed = suggestions.slice(0, 10).map(({ score, ...item }) => item);
+  const trimmed = suggestions.slice(0, 8).map(({ score, ...item }) => item);
   let correction = null;
   const artistCandidate = suggestions.filter(item => item.type === 'artist').sort((a, b) => b.score - a.score)[0];
   if (artistCandidate) {
-    const qFold = fold(q);
-    const candidateFold = fold(artistCandidate.value);
-    const similarity = textSimilarity(qFold, candidateFold);
-    if (candidateFold !== qFold && (candidateFold.startsWith(qFold) || similarity >= 0.62)) correction = artistCandidate.value;
+    const source = fold(q);
+    const candidate = fold(artistCandidate.value);
+    const similarity = textSimilarity(source, candidate);
+    if (candidate !== source && (candidate.startsWith(source) || similarity >= 0.62)) correction = artistCandidate.value;
   }
+
   const value = { suggestions: trimmed, correction };
   suggestionCache.set(cacheKey, { at: Date.now(), value });
   return value;
-}
-
-async function verifyTrack(track) {
-  if (!track?.id) return null;
-  const cached = verificationCache.get(track.id);
-  if (cached && Date.now() - cached.at < VERIFY_TTL_MS) {
-    return cached.ok ? { ...track, ...cached.meta, streamVerified: true, fullStream: true, isPreview: false } : null;
-  }
-  try {
-    const info = await scStreamInfo(track.id);
-    const verified = {
-      ...track,
-      streamVerified: true,
-      fullStream: true,
-      streamable: true,
-      isPreview: false,
-      providerMode: info.providerMode || track.providerMode || 'unknown',
-    };
-    verificationCache.set(track.id, { at: Date.now(), ok: true, meta: { providerMode: verified.providerMode } });
-    return verified;
-  } catch (error) {
-    verificationCache.set(track.id, { at: Date.now(), ok: false, status: error.status || 503 });
-    return null;
-  }
-}
-
-async function verifyTracks(tracks, limit) {
-  const output = [];
-  const queue = [...tracks];
-  const workers = Array.from({ length: Math.min(10, queue.length) }, async () => {
-    while (queue.length && output.length < limit) {
-      const track = queue.shift();
-      const verified = await verifyTrack(track);
-      if (verified) output.push(verified);
-    }
-  });
-  await Promise.all(workers);
-  return output.slice(0, limit);
 }
 
 function relevance(track, query, correction) {
@@ -296,22 +281,66 @@ function mergeResults(groups, limit, q, correction) {
   return merged.sort((a, b) => relevance(b, q, correction) - relevance(a, q, correction)).slice(0, limit);
 }
 
-async function providerSearch(q, limit, correction = null) {
-  const variants = [];
-  const pushVariant = value => {
-    const clean = normalizeQuery(value);
-    if (clean && !variants.some(existing => fold(existing) === fold(clean))) variants.push(clean);
-  };
-  pushVariant(q);
-  if (correction) pushVariant(correction);
-  const base = correction || q;
-  if (base.split(' ').length <= 3) {
-    pushVariant(`${base} official`);
-    pushVariant(`${base} audio`);
-    pushVariant(`${base} remix`);
+async function verifyTrack(track) {
+  if (!track?.id) return null;
+  const cached = verificationCache.get(track.id);
+  if (cached && Date.now() - cached.at < VERIFY_TTL_MS) {
+    return cached.ok ? { ...track, ...cached.meta, streamVerified: true, fullStream: true, isPreview: false, provisional: false } : null;
   }
 
-  const settled = await Promise.allSettled(variants.slice(0, 4).map(query => scSearch(query, 32)));
+  try {
+    const info = await resolveSoundCloudStream(track.id);
+    const verified = {
+      ...track,
+      streamVerified: true,
+      fullStream: true,
+      streamable: true,
+      isPreview: false,
+      provisional: false,
+      providerMode: info.providerMode || track.providerMode || 'unknown',
+    };
+    verificationCache.set(track.id, { at: Date.now(), ok: true, meta: { providerMode: verified.providerMode } });
+    return verified;
+  } catch (error) {
+    verificationCache.set(track.id, { at: Date.now(), ok: false, status: error.status || 503 });
+    return null;
+  }
+}
+
+async function verifyTracks(tracks, limit) {
+  const output = [];
+  const queue = [...tracks];
+  const workerCount = Math.min(10, queue.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (queue.length && output.length < limit) {
+      const track = queue.shift();
+      const verified = await verifyTrack(track);
+      if (verified) output.push(verified);
+    }
+  });
+  await Promise.all(workers);
+  return output.slice(0, limit);
+}
+
+function buildVariants(q, correction) {
+  const variants = [];
+  const push = value => {
+    const clean = normalizeQuery(value);
+    if (clean && !variants.some(item => fold(item) === fold(clean))) variants.push(clean);
+  };
+  push(q);
+  if (correction) push(correction);
+  const base = correction || q;
+  if (base.split(' ').length <= 3) {
+    push(`${base} official`);
+    push(`${base} audio`);
+    push(`${base} remix`);
+  }
+  return variants.slice(0, 4);
+}
+
+async function providerSearch(q, limit, correction = null) {
+  const settled = await Promise.allSettled(buildVariants(q, correction).map(query => scSearch(query, 35)));
   const candidates = [];
   const seen = new Set();
   for (const result of settled) {
@@ -330,32 +359,67 @@ async function providerSearch(q, limit, correction = null) {
   return verified;
 }
 
-function prewarmSearch(q, correction = null, limit = 30) {
-  const key = fold(q);
-  const cached = memoryCache.get(key);
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return Promise.resolve(cached.results);
-  if (prewarmPromises.has(key)) return prewarmPromises.get(key);
-
-  const promise = providerSearch(q, limit, correction)
-    .then(results => {
-      memoryCache.set(key, { at: Date.now(), results, correction, lyricMatches: 0 });
-      return results;
-    })
-    .finally(() => prewarmPromises.delete(key));
-  prewarmPromises.set(key, promise);
-  return promise;
+async function fastProviderSearch(q, limit) {
+  const tracks = await scSearch(q, Math.min(50, Math.max(limit, 30)));
+  return (tracks || []).map(track => ({
+    ...track,
+    provisional: true,
+    streamVerified: false,
+  })).slice(0, limit);
 }
 
 router.get('/suggest', async (req, res) => {
   const q = normalizeQuery(req.query.q);
   if (q.length < 2) return res.json({ suggestions: [], correction: null });
-  try {
-    const data = await buildSuggestions(q);
-    prewarmSearch(q, data.correction, 30).catch(() => {});
-    return res.json(data);
-  } catch (error) {
+  try { return res.json(await buildSuggestions(q)); }
+  catch (error) {
     console.warn('[Search suggest]', error.message);
     return res.json({ suggestions: [], correction: null });
+  }
+});
+
+router.get('/fast', async (req, res) => {
+  const q = normalizeQuery(req.query.q);
+  const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 40);
+  if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
+
+  const key = fold(q);
+  const deepCached = memoryCache.get(key);
+  if (deepCached && Date.now() - deepCached.at < CACHE_TTL_MS) {
+    return res.json({
+      results: deepCached.results.slice(0, limit),
+      source: 'aletone-cache',
+      cached: true,
+      provisional: false,
+      correction: deepCached.correction || null,
+      interpretedQuery: deepCached.correction || q,
+    });
+  }
+
+  const cached = fastCache.get(key);
+  if (cached && Date.now() - cached.at < FAST_CACHE_TTL_MS) return res.json({ ...cached.value, cached: true });
+
+  try {
+    const [local, provider] = await Promise.all([
+      localSearch(q, limit).catch(() => []),
+      fastProviderSearch(q, limit).catch(() => []),
+    ]);
+    const results = mergeResults([local, provider], limit, q, null);
+    const value = {
+      results,
+      source: local.length ? 'aletone-fast+index' : 'soundcloud-fast',
+      cached: false,
+      provisional: provider.some(item => item.provisional),
+      correction: null,
+      interpretedQuery: q,
+      searchMode: 'instant-metadata',
+    };
+    fastCache.set(key, { at: Date.now(), value });
+    console.log(`[Search fast] "${q}" results:${results.length}`);
+    return res.json(value);
+  } catch (error) {
+    console.warn('[Search fast]', error.message);
+    return res.status(503).json({ error: 'No fue posible consultar el catálogo en este momento.' });
   }
 });
 
@@ -368,9 +432,12 @@ router.get('/', async (req, res) => {
   const cached = memoryCache.get(cacheKey);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
     return res.json({
-      results: cached.results.slice(0, limit), source: 'aletone-cache', cached: true,
-      correction: cached.correction || null, interpretedQuery: cached.correction || q,
-      lyricMatches: cached.lyricMatches || 0, refreshing: false,
+      results: cached.results.slice(0, limit),
+      source: 'aletone-cache',
+      cached: true,
+      correction: cached.correction || null,
+      interpretedQuery: cached.correction || q,
+      lyricMatches: cached.lyricMatches || 0,
     });
   }
 
@@ -388,36 +455,28 @@ router.get('/', async (req, res) => {
     const local = await localSearch(interpretedQuery, limit);
     const localMerged = mergeResults([lyricResults, local], limit, q, suggestionData.correction);
     if (localMerged.length >= Math.min(DB_FAST_HIT, limit)) {
-      prewarmSearch(q, suggestionData.correction, limit).catch(error => console.warn('[Search refresh]', error.message));
-      memoryCache.set(cacheKey, {
-        at: Date.now(), results: localMerged, correction: suggestionData.correction,
-        lyricMatches: lyricResults.length,
-      });
+      providerSearch(q, limit, suggestionData.correction).then(fresh => {
+        const merged = mergeResults([lyricResults, fresh, localMerged], limit, q, suggestionData.correction);
+        memoryCache.set(cacheKey, { at: Date.now(), results: merged, correction: suggestionData.correction, lyricMatches: lyricResults.length });
+      }).catch(error => console.warn('[Search refresh]', error.message));
+
+      memoryCache.set(cacheKey, { at: Date.now(), results: localMerged, correction: suggestionData.correction, lyricMatches: lyricResults.length });
       return res.json({
-        results: localMerged, source: lyricResults.length ? 'aletone-index+lyrics' : 'aletone-index',
-        cached: true, refreshing: true, correction: suggestionData.correction,
-        interpretedQuery, lyricMatches: lyricResults.length,
+        results: localMerged,
+        source: lyricResults.length ? 'aletone-index+lyrics' : 'aletone-index',
+        cached: true,
+        refreshing: true,
+        correction: suggestionData.correction,
+        interpretedQuery,
+        lyricMatches: lyricResults.length,
       });
     }
   } catch (error) {
     console.warn('[Search local]', error.message);
   }
 
-  const existingWarm = prewarmPromises.get(cacheKey);
-  if (existingWarm) {
-    await Promise.race([existingWarm.catch(() => null), new Promise(resolve => setTimeout(resolve, 1200))]);
-    const warmed = memoryCache.get(cacheKey);
-    if (warmed?.results?.length) {
-      return res.json({
-        results: warmed.results.slice(0, limit), source: 'aletone-prewarmed', cached: true,
-        refreshing: false, correction: warmed.correction || suggestionData.correction,
-        interpretedQuery: warmed.correction || interpretedQuery, lyricMatches: warmed.lyricMatches || lyricResults.length,
-      });
-    }
-  }
-
   try {
-    const providerResults = await prewarmSearch(q, suggestionData.correction, limit);
+    const providerResults = await providerSearch(q, limit, suggestionData.correction);
     const results = mergeResults([lyricResults, providerResults], limit, q, suggestionData.correction);
     if (!results.length) {
       return res.status(404).json({
@@ -426,14 +485,21 @@ router.get('/', async (req, res) => {
         suggestions: suggestionData.suggestions,
       });
     }
-    memoryCache.set(cacheKey, {
-      at: Date.now(), results, correction: suggestionData.correction, lyricMatches: lyricResults.length,
-    });
-    console.log(`[Search] "${q}" -> "${interpretedQuery}" verified:${results.length} lyrics:${lyricResults.length}`);
+
+    memoryCache.set(cacheKey, { at: Date.now(), results, correction: suggestionData.correction, lyricMatches: lyricResults.length });
+    fastCache.set(cacheKey, { at: Date.now(), value: {
+      results, source: 'aletone-cache', cached: true, provisional: false,
+      correction: suggestionData.correction, interpretedQuery,
+    } });
+    console.log(`[Search deep] "${q}" -> "${interpretedQuery}" verified:${results.length} lyrics:${lyricResults.length}`);
     return res.json({
-      results, source: lyricResults.length ? 'aletone-smart+lyrics' : 'soundcloud-verified', cached: false,
-      refreshing: false, correction: suggestionData.correction, interpretedQuery,
-      suggestions: suggestionData.suggestions, lyricMatches: lyricResults.length,
+      results,
+      source: lyricResults.length ? 'aletone-smart+lyrics' : 'soundcloud-verified',
+      cached: false,
+      correction: suggestionData.correction,
+      interpretedQuery,
+      suggestions: suggestionData.suggestions,
+      lyricMatches: lyricResults.length,
       searchMode: lyricResults.length ? 'smart-metadata+lyrics' : 'smart-metadata',
     });
   } catch (error) {
@@ -443,9 +509,13 @@ router.get('/', async (req, res) => {
       const fallback = mergeResults([lyricResults, local], limit, q, suggestionData.correction);
       if (fallback.length) {
         return res.json({
-          results: fallback, source: lyricResults.length ? 'aletone-index+lyrics' : 'aletone-index',
-          cached: true, stale: true, correction: suggestionData.correction,
-          interpretedQuery, lyricMatches: lyricResults.length,
+          results: fallback,
+          source: lyricResults.length ? 'aletone-index+lyrics' : 'aletone-index',
+          cached: true,
+          stale: true,
+          correction: suggestionData.correction,
+          interpretedQuery,
+          lyricMatches: lyricResults.length,
         });
       }
     } catch (_) {}
