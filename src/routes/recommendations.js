@@ -1,9 +1,12 @@
 const router = require('express').Router();
 const { db } = require('../config/db');
 const auth = require('../middleware/auth');
-const { scSearch, scRelated } = require('../services/soundcloud');
+const { scSearch, scRelated, scStreamInfo } = require('../services/soundcloud');
 
 router.use(auth);
+
+const playabilityCache = new Map();
+const PLAYABILITY_TTL_MS = 10 * 60_000;
 
 const norm = (value) => String(value || '')
   .normalize('NFD')
@@ -30,6 +33,37 @@ function popularity(track) {
 
 function trackKey(track) {
   return `${norm(track.title)}|${norm(track.artist)}`;
+}
+
+async function verifyPlayable(track) {
+  if (!track?.id) return null;
+  const cached = playabilityCache.get(track.id);
+  if (cached && Date.now() - cached.at < PLAYABILITY_TTL_MS) {
+    return cached.ok ? { ...track, streamVerified: true, fullStream: true, isPreview: false } : null;
+  }
+
+  try {
+    await scStreamInfo(track.id);
+    playabilityCache.set(track.id, { at: Date.now(), ok: true });
+    return { ...track, streamVerified: true, fullStream: true, streamable: true, isPreview: false };
+  } catch (_) {
+    playabilityCache.set(track.id, { at: Date.now(), ok: false });
+    return null;
+  }
+}
+
+async function verifyPool(pool) {
+  const output = [];
+  const queue = [...pool];
+  const workers = Array.from({ length: Math.min(6, queue.length) }, async () => {
+    while (queue.length) {
+      const candidate = queue.shift();
+      const track = await verifyPlayable(candidate.track);
+      if (track) output.push({ ...candidate, track });
+    }
+  });
+  await Promise.all(workers);
+  return output;
 }
 
 async function loadTasteProfile(userId) {
@@ -139,7 +173,7 @@ async function buildCandidatePool(seedTrackId, seedArtist, profile, limit) {
 
   if (seedArtist) {
     tasks.push(
-      scSearch(seedArtist, Math.max(12, Math.ceil(limit * 0.8)))
+      scSearch(seedArtist, Math.max(12, Math.ceil(limit * 1.2)))
         .then(items => items.map(track => ({ track, origin: 'seed-artist' })))
     );
   }
@@ -151,7 +185,7 @@ async function buildCandidatePool(seedTrackId, seedArtist, profile, limit) {
 
   for (const artist of topArtists) {
     tasks.push(
-      scSearch(artist, 7)
+      scSearch(artist, 9)
         .then(items => items.map(track => ({ track, origin: 'taste-artist' })))
     );
   }
@@ -164,7 +198,8 @@ async function buildCandidatePool(seedTrackId, seedArtist, profile, limit) {
   }
 
   const settled = await Promise.allSettled(tasks);
-  return settled.flatMap(result => result.status === 'fulfilled' ? result.value : []);
+  const candidates = settled.flatMap(result => result.status === 'fulfilled' ? result.value : []);
+  return verifyPool(candidates);
 }
 
 function scoreCandidate(candidate, context) {
@@ -204,7 +239,6 @@ function scoreCandidate(candidate, context) {
     else if (ageDays < 10) score -= 10;
   }
 
-  // Variación estable: la misma sesión no cambia de forma arbitraria como con Math.random().
   score += (deterministicNoise(track.id) - 0.5) * 5;
   return score;
 }
@@ -241,7 +275,7 @@ router.get('/', async (req, res) => {
     const pool = await buildCandidatePool(seedTrackId, seedArtist, profile, limit);
 
     const scored = pool
-      .filter(({ track }) => track?.id && track.fullStream !== false && track.id !== seedTrackId)
+      .filter(({ track }) => track?.id && track.streamVerified === true && track.id !== seedTrackId)
       .map(candidate => ({
         ...candidate,
         score: scoreCandidate(candidate, { seedArtist, profile }),
@@ -257,7 +291,8 @@ router.get('/', async (req, res) => {
         .slice(0, 5)
         .map(([key]) => profile.artists.find(row => norm(row.artist) === key)?.artist || key),
       seed: { trackId: seedTrackId || null, artist: seedArtist || null },
-      algorithm: 'aletone-taste-graph-v1',
+      algorithm: 'aletone-taste-graph-v1.1',
+      verifiedPlayback: true,
       personalized: profile.artistWeights.size > 0,
     });
   } catch (error) {
