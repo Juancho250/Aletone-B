@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { db } = require('../config/db');
 const { scSearch, scStreamInfo } = require('../services/soundcloud');
+const { searchLyrics, warmLyrics } = require('../services/lyrics');
 
 const memoryCache = new Map();
 const verificationCache = new Map();
@@ -163,7 +164,7 @@ async function localSearch(q, limit) {
 }
 
 async function recentVocabulary() {
-  const rows = await db.all(
+  return db.all(
     `SELECT artist, title, thumbnail, MAX(updated_at) AS updated_at
      FROM tracks
      WHERE source = 'soundcloud'
@@ -173,7 +174,6 @@ async function recentVocabulary() {
      ORDER BY updated_at DESC
      LIMIT 300`
   );
-  return rows;
 }
 
 function rankSuggestion(query, value, type) {
@@ -214,8 +214,6 @@ async function buildSuggestions(q) {
   } catch (_) {}
 
   try {
-    // SoundCloud ya hace búsqueda sobre título, usuario y descripción. Usamos esa
-    // señal para predecir nombres aunque el usuario escriba parcialmente o con error.
     const provider = await scSearch(q, 20);
     for (const track of provider) {
       const candidates = [
@@ -296,7 +294,7 @@ function relevance(track, query, correction) {
   const q = fold(correction || query);
   const title = fold(track.title);
   const artist = fold(track.artist);
-  let score = 0;
+  let score = track.matchReason === 'lyrics' ? 80 : 0;
   if (artist === q) score += 100;
   if (title === q) score += 95;
   if (artist.startsWith(q)) score += 70;
@@ -306,6 +304,24 @@ function relevance(track, query, correction) {
   score += Math.min(22, Math.log10(Number(track.playbackCount || 0) + 1) * 4);
   score += Math.min(12, Math.log10(Number(track.likesCount || 0) + 1) * 3);
   return score;
+}
+
+function mergeResults(groups, limit, q, correction) {
+  const seenIds = new Set();
+  const seenKeys = new Set();
+  const merged = [];
+  for (const group of groups) {
+    for (const track of group || []) {
+      const key = `${fold(track.title)}|${fold(track.artist)}`;
+      if (!track?.id || seenIds.has(track.id) || seenKeys.has(key)) continue;
+      seenIds.add(track.id);
+      seenKeys.add(key);
+      merged.push(track);
+    }
+  }
+  return merged
+    .sort((a, b) => relevance(b, q, correction) - relevance(a, q, correction))
+    .slice(0, limit);
 }
 
 async function providerSearch(q, limit, correction = null) {
@@ -318,8 +334,6 @@ async function providerSearch(q, limit, correction = null) {
   pushVariant(q);
   if (correction) pushVariant(correction);
 
-  // En legacy-public una gran parte del catálogo comercial es preview. Buscamos
-  // variantes razonables para encontrar uploads reproducibles sin degradar relevancia.
   const base = correction || q;
   if (base.split(' ').length <= 3) {
     pushVariant(`${base} official`);
@@ -347,8 +361,9 @@ async function providerSearch(q, limit, correction = null) {
   const verified = await verifyTracks(candidates, limit);
   verified.sort((a, b) => relevance(b, q, correction) - relevance(a, q, correction));
 
-  memoryCache.set(fold(q), { at: Date.now(), results: verified, correction });
-  saveTracks(verified).catch(error => console.warn('[Search cache]', error.message));
+  saveTracks(verified)
+    .then(() => warmLyrics(verified, 4))
+    .catch(error => console.warn('[Search cache]', error.message));
   return verified;
 }
 
@@ -377,6 +392,7 @@ router.get('/', async (req, res) => {
       cached: true,
       correction: cached.correction || null,
       interpretedQuery: cached.correction || q,
+      lyricMatches: cached.lyricMatches || 0,
     });
   }
 
@@ -384,17 +400,29 @@ router.get('/', async (req, res) => {
   try { suggestionData = await buildSuggestions(q); } catch (_) {}
   const interpretedQuery = suggestionData.correction || q;
 
+  let lyricResults = [];
+  if (q.split(/\s+/).length >= 3) {
+    try { lyricResults = await searchLyrics(q, Math.min(12, limit)); }
+    catch (error) { console.warn('[Lyrics search]', error.message); }
+  }
+
   try {
     const local = await localSearch(interpretedQuery, limit);
-    if (local.length >= Math.min(DB_FAST_HIT, limit)) {
+    const localMerged = mergeResults([lyricResults, local], limit, q, suggestionData.correction);
+    if (localMerged.length >= Math.min(DB_FAST_HIT, limit)) {
       providerSearch(q, limit, suggestionData.correction).catch(error => console.warn('[Search refresh]', error.message));
+      memoryCache.set(cacheKey, {
+        at: Date.now(), results: localMerged, correction: suggestionData.correction,
+        lyricMatches: lyricResults.length,
+      });
       return res.json({
-        results: local.slice(0, limit),
-        source: 'aletone-index',
+        results: localMerged,
+        source: lyricResults.length ? 'aletone-index+lyrics' : 'aletone-index',
         cached: true,
         refreshing: true,
         correction: suggestionData.correction,
         interpretedQuery,
+        lyricMatches: lyricResults.length,
       });
     }
   } catch (error) {
@@ -402,7 +430,8 @@ router.get('/', async (req, res) => {
   }
 
   try {
-    const results = await providerSearch(q, limit, suggestionData.correction);
+    const providerResults = await providerSearch(q, limit, suggestionData.correction);
+    const results = mergeResults([lyricResults, providerResults], limit, q, suggestionData.correction);
     if (!results.length) {
       return res.status(404).json({
         error: 'No encontramos una versión completa reproducible para esta búsqueda.',
@@ -410,28 +439,36 @@ router.get('/', async (req, res) => {
         suggestions: suggestionData.suggestions,
       });
     }
-    console.log(`[Search] "${q}" -> "${interpretedQuery}" verified:${results.length}`);
+
+    memoryCache.set(cacheKey, {
+      at: Date.now(), results, correction: suggestionData.correction,
+      lyricMatches: lyricResults.length,
+    });
+    console.log(`[Search] "${q}" -> "${interpretedQuery}" verified:${results.length} lyrics:${lyricResults.length}`);
     return res.json({
       results,
-      source: 'soundcloud-verified',
+      source: lyricResults.length ? 'aletone-smart+lyrics' : 'soundcloud-verified',
       cached: false,
       correction: suggestionData.correction,
       interpretedQuery,
       suggestions: suggestionData.suggestions,
-      searchMode: 'smart-metadata',
+      lyricMatches: lyricResults.length,
+      searchMode: lyricResults.length ? 'smart-metadata+lyrics' : 'smart-metadata',
     });
   } catch (error) {
     console.warn('[SC search]', error.message);
     try {
       const local = await localSearch(interpretedQuery, limit);
-      if (local.length) {
+      const fallback = mergeResults([lyricResults, local], limit, q, suggestionData.correction);
+      if (fallback.length) {
         return res.json({
-          results: local,
-          source: 'aletone-index',
+          results: fallback,
+          source: lyricResults.length ? 'aletone-index+lyrics' : 'aletone-index',
           cached: true,
           stale: true,
           correction: suggestionData.correction,
           interpretedQuery,
+          lyricMatches: lyricResults.length,
         });
       }
     } catch (_) {}
