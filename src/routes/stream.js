@@ -12,7 +12,7 @@ const { pipeAudio, downloadAudio } = require('../services/ffmpeg');
 const { sanitize } = require('../utils/helpers');
 
 const DOWNLOADS_DIR = path.join(__dirname, '../../downloads');
-const TRACK_ID_RE = /^(?:au|sc|dz)_[A-Za-z0-9_-]{1,180}$/;
+const TRACK_ID_RE = /^(?:au|sc|dz|yt)_[A-Za-z0-9_-]{1,180}$/;
 const ONE_DAY_MS = 86_400_000;
 const cleanupTimer = setInterval(cleanOldDownloads, 3_600_000);
 cleanupTimer.unref?.();
@@ -42,6 +42,13 @@ function cleanOldDownloads() {
 
 async function resolveAudioSource(trackId) {
   assertTrackId(trackId);
+
+  if (trackId.startsWith('yt_')) {
+    const error = new Error('YouTube se reproduce con el reproductor embebido, no como stream de audio.');
+    error.status = 409;
+    error.code = 'YOUTUBE_IFRAME_REQUIRED';
+    throw error;
+  }
 
   if (trackId.startsWith('au_')) {
     return {
@@ -81,6 +88,18 @@ router.get('/url/:trackId', async (req, res) => {
   res.setHeader('Cache-Control', 'private, max-age=60');
   try {
     const trackId = assertTrackId(req.params.trackId);
+
+    if (trackId.startsWith('yt_')) {
+      return res.json({
+        url: null,
+        mode: 'youtube-iframe',
+        source: 'youtube',
+        videoId: trackId.slice(3),
+        isPreview: false,
+        warmed: true,
+      });
+    }
+
     const audio = await resolveAudioSource(trackId);
 
     if (trackId.startsWith('au_')) {
@@ -105,7 +124,7 @@ router.get('/url/:trackId', async (req, res) => {
       warmed: true,
     });
   } catch (error) {
-    return res.status(error.status || 503).json({ error: error.message });
+    return res.status(error.status || 503).json({ error: error.message, code: error.code || undefined });
   }
 });
 
@@ -118,6 +137,13 @@ router.post('/download', async (req, res) => {
 
   try {
     assertTrackId(videoId);
+    if (videoId.startsWith('yt_')) {
+      return res.status(409).json({
+        error: 'Las pistas de YouTube no se pueden guardar offline desde ALEON.',
+        code: 'YOUTUBE_OFFLINE_NOT_ALLOWED',
+      });
+    }
+
     const filename = buildDownloadName(videoId, title);
     const filepath = path.join(DOWNLOADS_DIR, filename);
 
@@ -131,8 +157,6 @@ router.post('/download', async (req, res) => {
     }
 
     if (videoId.startsWith('au_')) {
-      // Streaming permission and download permission are different in Audius.
-      // Respect the artist's downloadable flag before persisting an offline file.
       const track = await getAudiusTrack(videoId);
       if (!track?.downloadable) {
         return res.status(409).json({
@@ -161,6 +185,7 @@ router.post('/download', async (req, res) => {
     console.error('[download]', error.message);
     return res.status(error.status || 500).json({
       error: error.status === 400 ? error.message : (error.message || 'No fue posible preparar la descarga'),
+      code: error.code || undefined,
     });
   }
 });
@@ -168,6 +193,12 @@ router.post('/download', async (req, res) => {
 router.get('/:trackId', async (req, res) => {
   try {
     const trackId = assertTrackId(req.params.trackId);
+    if (trackId.startsWith('yt_')) {
+      return res.status(409).json({
+        error: 'Esta pista usa el reproductor embebido de YouTube.',
+        code: 'YOUTUBE_IFRAME_REQUIRED',
+      });
+    }
     if (trackId.startsWith('au_')) return proxyAudiusStream(trackId, req, res);
 
     res.setHeader('Cache-Control', 'no-store');
@@ -176,7 +207,7 @@ router.get('/:trackId', async (req, res) => {
     return pipeAudio(audio.url, res, req);
   } catch (error) {
     console.error('[stream]', error.message);
-    if (!res.headersSent) return res.status(error.status || 503).json({ error: error.message });
+    if (!res.headersSent) return res.status(error.status || 503).json({ error: error.message, code: error.code || undefined });
     return undefined;
   }
 });
