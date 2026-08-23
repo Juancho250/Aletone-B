@@ -6,7 +6,9 @@ const BASE = 'https://api.audius.co/v1';
 const DEFAULT_TIMEOUT_MS = 6500;
 
 function apiHeaders(extra = {}) {
-  const token = String(process.env.AUDIUS_API_KEY || '').trim();
+  // Audius direct REST access uses the app Bearer Token server-side. Read-only
+  // calls still work without credentials; never expose the bearer token in frontend code.
+  const token = String(process.env.AUDIUS_BEARER_TOKEN || '').trim();
   return {
     Accept: 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -220,7 +222,7 @@ async function downloadTrackToFile(trackId, outputPath) {
 }
 
 function providerStatus() {
-  return { ok: true, mode: process.env.AUDIUS_API_KEY ? 'api-key' : 'public-read', base: BASE };
+  return { ok: true, mode: process.env.AUDIUS_BEARER_TOKEN ? 'bearer-token' : 'public-read', base: BASE };
 }
 
 module.exports = {
