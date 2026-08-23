@@ -12,17 +12,42 @@ const PORT = Number(process.env.PORT || 3000);
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 
+const DEFAULT_ALLOWED_ORIGINS = new Set([
+  'https://aleonmusic.vercel.app',
+  'https://aletone.vercel.app',
+  'https://aletone-juancho250s-projects.vercel.app',
+  'https://aletone-git-main-juancho250s-projects.vercel.app',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+]);
+
 function getAllowedOrigins() {
-  return String(process.env.CORS_ORIGINS || '')
+  const configured = String(process.env.CORS_ORIGINS || '')
     .split(',')
     .map(value => value.trim())
     .filter(Boolean);
+  return new Set([...DEFAULT_ALLOWED_ORIGINS, ...configured]);
+}
+
+function isTrustedVercelPreview(origin) {
+  if (!origin) return false;
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'https:' || !url.hostname.endsWith('.vercel.app')) return false;
+    const host = url.hostname.toLowerCase();
+    return host === 'aleonmusic.vercel.app'
+      || host === 'aletone.vercel.app'
+      || /^aletone-[a-z0-9-]+-juancho250s-projects\.vercel\.app$/.test(host)
+      || /^aletone-git-[a-z0-9-]+-juancho250s-projects\.vercel\.app$/.test(host);
+  } catch (_) {
+    return false;
+  }
 }
 
 const allowedOrigins = getAllowedOrigins();
 const corsOptions = {
   origin(origin, callback) {
-    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+    if (!origin || allowedOrigins.has(origin) || isTrustedVercelPreview(origin)) {
       callback(null, true);
       return;
     }
@@ -31,6 +56,7 @@ const corsOptions = {
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Range'],
   exposedHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges'],
+  credentials: false,
   maxAge: 86400,
 };
 
