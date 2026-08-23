@@ -66,9 +66,10 @@ app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'aletone-api',
-    version: '14',
+    version: '15',
     connect: true,
     tasteGraph: 'v1',
+    search: 'predictive-verified-v1',
     soundcloudMode: soundCloudMode(),
   });
 });
@@ -84,9 +85,10 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '14',
+    version: '15',
     connect: true,
     tasteGraph: 'v1',
+    search: 'predictive-verified-v1',
     soundcloud: sc.status === 'fulfilled'
       ? sc.value
       : { ok: false, mode: soundCloudMode(), error: sc.reason?.message },
@@ -108,7 +110,7 @@ initDB()
   .then(() => warmSoundCloud().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`Aletone API v14 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
+      console.log(`Aletone API v15 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
