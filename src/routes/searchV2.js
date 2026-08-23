@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { db } = require('../config/db');
 const { unifiedSearch, fold, similarity, isNoisy } = require('../services/catalogMatcher');
+const { resolveCatalogSource, resolverStats } = require('../services/catalogResolver');
 const { autocomplete: audiusAutocomplete } = require('../providers/audius');
 const { searchSuggestions: deezerSuggestions } = require('../providers/deezerCatalog');
 const { searchLyrics, warmLyrics } = require('../services/lyrics');
@@ -9,7 +10,7 @@ const responseCache = new Map();
 const suggestionCache = new Map();
 const CACHE_MS = 3 * 60_000;
 const SUGGEST_MS = 5 * 60_000;
-const CATALOG_VERSION = 'aleon-youtube-canonical-v5';
+const CATALOG_VERSION = 'aleon-lazy-playback-v6';
 
 function normalizeQuery(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 180);
@@ -130,6 +131,22 @@ router.get('/suggest', async (req, res) => {
   }
 });
 
+router.post('/resolve', async (req, res) => {
+  try {
+    const track = await resolveCatalogSource(req.body || {}, { allowSoundCloud: true });
+    if (!track) {
+      return res.status(404).json({
+        error: 'No encontramos una fuente reproducible para esta canción todavía.',
+        code: 'SOURCE_NOT_FOUND',
+      });
+    }
+    saveTracks([track]).catch(() => {});
+    return res.json({ track, resolver: resolverStats() });
+  } catch (error) {
+    return res.status(error.status || 503).json({ error: error.message || 'No fue posible resolver la canción.' });
+  }
+});
+
 router.get('/fast', async (req, res) => {
   const q = normalizeQuery(req.query.q);
   const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 40);
@@ -145,11 +162,11 @@ router.get('/fast', async (req, res) => {
       albums: result.albums,
       catalogTracks: result.catalogTracks.slice(0, 30),
       artistMode: result.artistMode || null,
-      providers: { ...result.providers, playbackPrimary: 'audius', playbackFallback: null },
+      providers: { ...result.providers, playbackPrimary: 'youtube-on-demand', playbackFallback: null },
       cached: result.cached,
       provisional: true,
       interpretedQuery: q,
-      searchMode: 'aleon-fast-youtube-canonical-v1',
+      searchMode: 'aleon-instant-catalog-v1',
       availability: {
         playable: playable.length,
         catalog: result.catalogTracks.length,
@@ -167,25 +184,27 @@ router.get('/', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 40);
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
 
-  const key = `${fold(q)}|${limit}|youtube-canonical-v5`;
+  const key = `${fold(q)}|${limit}|instant-catalog-v6`;
   const cached = responseCache.get(key);
   if (cached && Date.now() - cached.at < CACHE_MS) return res.json({ ...cached.value, cached: true });
 
   try {
     const [suggestionData, result] = await Promise.all([
       suggestionsFor(q).catch(() => ({ suggestions: [], correction: null })),
-      unifiedSearch(q, limit, { includeSoundCloudFallback: true, quick: false }),
+      // Important: do not block the whole search resolving 20-30 audio sources.
+      // Return canonical Deezer results immediately and resolve missing playback only when the user taps a song.
+      unifiedSearch(q, limit, { includeSoundCloudFallback: false, quick: true }),
     ]);
 
     let lyricResults = [];
     if (q.split(/\s+/).length >= 3) {
-      lyricResults = await searchLyrics(q, Math.min(8, limit)).catch(() => []);
+      lyricResults = await searchLyrics(q, Math.min(6, limit)).catch(() => []);
       lyricResults = lyricResults.filter(track => !isNoisy(track, q) && isSearchPlayable(track));
     }
 
     const results = dedupe([...result.tracks, ...lyricResults], limit);
     const lyricWarmable = results.filter(track => track.source !== 'youtube');
-    saveTracks(results).then(() => warmLyrics(lyricWarmable, 5)).catch(error => console.warn('[ALEON catalog cache]', error.message));
+    saveTracks(results).then(() => warmLyrics(lyricWarmable, 4)).catch(error => console.warn('[ALEON catalog cache]', error.message));
 
     const value = {
       results,
@@ -193,13 +212,19 @@ router.get('/', async (req, res) => {
       albums: result.albums,
       catalogTracks: result.catalogTracks.slice(0, 30),
       artistMode: result.artistMode || null,
-      providers: result.providers,
+      providers: {
+        ...result.providers,
+        playbackPrimary: 'youtube-on-demand',
+        playbackSecondary: 'audius',
+        playbackFallback: 'soundcloud-on-demand',
+        lazyResolver: true,
+      },
       correction: suggestionData.correction,
       suggestions: suggestionData.suggestions,
       interpretedQuery: suggestionData.correction || q,
       lyricMatches: lyricResults.length,
       cached: result.cached,
-      searchMode: lyricResults.length ? 'aleon-youtube-canonical+lyrics' : 'aleon-youtube-canonical',
+      searchMode: lyricResults.length ? 'aleon-instant-catalog+lyrics' : 'aleon-instant-catalog',
       availability: {
         playable: results.length,
         catalog: result.catalogTracks.length,
@@ -209,7 +234,7 @@ router.get('/', async (req, res) => {
       },
     };
     responseCache.set(key, { at: Date.now(), value });
-    console.log(`[ALEON Search] "${q}" catalog:${result.catalogTracks.length} playable:${results.length} AU:${value.availability.audius} YT:${value.availability.youtube} SCv:${value.availability.soundcloudVerified}`);
+    console.log(`[ALEON Search] "${q}" instant catalog:${result.catalogTracks.length} ready:${results.length} AU:${value.availability.audius} YT:${value.availability.youtube}`);
     return res.json(value);
   } catch (error) {
     console.error('[ALEON Search]', error);
