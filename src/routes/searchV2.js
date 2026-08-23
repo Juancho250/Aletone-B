@@ -9,7 +9,7 @@ const responseCache = new Map();
 const suggestionCache = new Map();
 const CACHE_MS = 3 * 60_000;
 const SUGGEST_MS = 5 * 60_000;
-const CATALOG_VERSION = 'aleon-canonical-first-v4';
+const CATALOG_VERSION = 'aleon-youtube-canonical-v5';
 
 function normalizeQuery(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 180);
@@ -20,6 +20,7 @@ function isSearchPlayable(track) {
   const id = String(track.id);
   const source = String(track.source || '').toLowerCase();
   if (id.startsWith('au_') || source === 'audius') return true;
+  if (id.startsWith('yt_') || source === 'youtube') return Boolean(track.youtubeVideoId || track.externalId) && track.playbackVerified !== false;
   return (id.startsWith('sc_') || source === 'soundcloud') && track.playbackVerified === true && track.streamVerified === true;
 }
 
@@ -59,7 +60,7 @@ async function saveTracks(tracks) {
     [
       track.id,
       track.source,
-      track.externalId || null,
+      track.externalId || track.youtubeVideoId || null,
       track.canonicalTitle || track.title,
       track.artist || null,
       track.catalogAlbum || track.album || null,
@@ -70,14 +71,16 @@ async function saveTracks(tracks) {
         genre: track.genre || '',
         mood: track.mood || '',
         permalink: track.permalink || '',
-        releaseDate: track.releaseDate || null,
+        releaseDate: track.releaseDate || track.publishedAt || null,
         playbackCount: Number(track.playbackCount || 0),
         likesCount: Number(track.likesCount || 0),
         repostsCount: Number(track.repostsCount || 0),
         providerMode: track.providerMode || track.source,
-        streamVerified: true,
+        youtubeVideoId: track.youtubeVideoId || null,
+        streamVerified: track.source === 'youtube' ? false : true,
         playbackVerified: track.source === 'soundcloud' ? track.playbackVerified === true : true,
         fullStream: true,
+        downloadable: track.source === 'audius' ? Boolean(track.downloadable) : false,
         catalogVersion: CATALOG_VERSION,
         catalogMatched: Boolean(track.catalogMatched),
         catalogId: track.catalogId || null,
@@ -133,11 +136,9 @@ router.get('/fast', async (req, res) => {
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
 
   try {
-    // Fast pass: canonical Deezer catalog + already-obvious Audius matches only.
-    // The UI can render the official catalog immediately while the deep pass resolves audio.
     const result = await unifiedSearch(q, limit, { includeSoundCloudFallback: false, quick: true });
     const playable = dedupe(result.tracks, limit);
-    saveTracks(playable).then(() => warmLyrics(playable, 3)).catch(() => {});
+    saveTracks(playable).then(() => warmLyrics(playable.filter(track => track.source !== 'youtube'), 3)).catch(() => {});
     return res.json({
       results: playable,
       artists: result.artists,
@@ -148,8 +149,12 @@ router.get('/fast', async (req, res) => {
       cached: result.cached,
       provisional: true,
       interpretedQuery: q,
-      searchMode: 'aleon-fast-canonical-v1',
-      availability: { playable: playable.length, catalog: result.catalogTracks.length },
+      searchMode: 'aleon-fast-youtube-canonical-v1',
+      availability: {
+        playable: playable.length,
+        catalog: result.catalogTracks.length,
+        youtube: playable.filter(track => track.source === 'youtube').length,
+      },
     });
   } catch (error) {
     console.warn('[ALEON search fast]', error.message);
@@ -162,7 +167,7 @@ router.get('/', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 40);
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
 
-  const key = `${fold(q)}|${limit}|canonical-first-v4`;
+  const key = `${fold(q)}|${limit}|youtube-canonical-v5`;
   const cached = responseCache.get(key);
   if (cached && Date.now() - cached.at < CACHE_MS) return res.json({ ...cached.value, cached: true });
 
@@ -179,7 +184,8 @@ router.get('/', async (req, res) => {
     }
 
     const results = dedupe([...result.tracks, ...lyricResults], limit);
-    saveTracks(results).then(() => warmLyrics(results, 5)).catch(error => console.warn('[ALEON catalog cache]', error.message));
+    const lyricWarmable = results.filter(track => track.source !== 'youtube');
+    saveTracks(results).then(() => warmLyrics(lyricWarmable, 5)).catch(error => console.warn('[ALEON catalog cache]', error.message));
 
     const value = {
       results,
@@ -193,16 +199,17 @@ router.get('/', async (req, res) => {
       interpretedQuery: suggestionData.correction || q,
       lyricMatches: lyricResults.length,
       cached: result.cached,
-      searchMode: lyricResults.length ? 'aleon-canonical-first+lyrics' : 'aleon-canonical-first',
+      searchMode: lyricResults.length ? 'aleon-youtube-canonical+lyrics' : 'aleon-youtube-canonical',
       availability: {
         playable: results.length,
         catalog: result.catalogTracks.length,
         audius: results.filter(track => track.source === 'audius').length,
+        youtube: results.filter(track => track.source === 'youtube').length,
         soundcloudVerified: results.filter(track => track.source === 'soundcloud' && track.playbackVerified === true).length,
       },
     };
     responseCache.set(key, { at: Date.now(), value });
-    console.log(`[ALEON Search] "${q}" catalog:${result.catalogTracks.length} playable:${results.length} AU:${value.availability.audius} SCv:${value.availability.soundcloudVerified} canonical-first`);
+    console.log(`[ALEON Search] "${q}" catalog:${result.catalogTracks.length} playable:${results.length} AU:${value.availability.audius} YT:${value.availability.youtube} SCv:${value.availability.soundcloudVerified}`);
     return res.json(value);
   } catch (error) {
     console.error('[ALEON Search]', error);
