@@ -5,6 +5,7 @@ const cors = require('cors');
 const { initDB } = require('./src/config/db');
 const { warmSoundCloud, soundCloudMode } = require('./src/services/soundcloud');
 const { providerStatus: audiusStatus, trendingTracks: audiusTrending } = require('./src/providers/audius');
+const { providerStatus: youtubeStatus } = require('./src/providers/youtube');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -93,23 +94,24 @@ app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
 
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ ok: true, service: 'aleon-api', version: '23' });
+  res.status(200).json({ ok: true, service: 'aleon-api', version: '24' });
 });
 
 app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'aleon-api',
-    version: '23',
+    version: '24',
     brand: 'ALEON',
     connect: true,
     tasteGraph: 'v2',
     radio: 'v2',
-    search: 'canonical-first-v1',
-    playback: 'audius+verified-soundcloud',
+    search: 'deezer+youtube-canonical-v1',
+    playback: 'audius+youtube-iframe+verified-soundcloud',
     providers: {
       catalog: 'deezer',
       playbackPrimary: 'audius',
+      playbackSecondary: 'youtube-iframe',
       playbackFallback: 'soundcloud-canonical-preverified',
     },
   });
@@ -128,14 +130,15 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '23',
+    version: '24',
     brand: 'ALEON',
     connect: true,
     tasteGraph: 'v2',
     radio: 'v2',
-    search: 'canonical-first-v1',
-    playback: 'audius+verified-soundcloud',
+    search: 'deezer+youtube-canonical-v1',
+    playback: 'audius+youtube-iframe+verified-soundcloud',
     audius: audius.status === 'fulfilled' ? audius.value : { ok: false, error: audius.reason?.message },
+    youtube: youtubeStatus(),
     deezer: deezer.status === 'fulfilled' ? deezer.value : { ok: false, error: deezer.reason?.message },
     soundcloudFallback: { mode: soundCloudMode(), scope: 'canonical-preverified', resolver: getStreamResolverStats() },
     database: dbCheck.status === 'fulfilled' ? dbCheck.value : { ok: false, error: dbCheck.reason?.message },
@@ -154,7 +157,7 @@ let server;
 initDB()
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`ALEON API v23 corriendo en puerto ${PORT} · canonical Deezer search · Audius primary · verified SoundCloud fallback`);
+      console.log(`ALEON API v24 corriendo en puerto ${PORT} · Deezer catalog · Audius audio · YouTube iframe · verified SoundCloud fallback`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
