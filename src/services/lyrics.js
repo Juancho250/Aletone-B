@@ -13,7 +13,7 @@ async function requestJSON(url, timeoutMs = 10_000) {
       signal: ctrl.signal,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'Aletone/1.0 (music search; contact via project repository)',
+        'User-Agent': 'ALEON/1.0 (music search; contact via project repository)',
       },
     });
     if (response.status === 404) return null;
@@ -45,12 +45,11 @@ async function getCached(trackId) {
 async function fetchLyrics(track) {
   if (!usableTrack(track)) return null;
   const params = new URLSearchParams({
-    track_name: String(track.title).slice(0, 300),
+    track_name: String(track.canonicalTitle || track.title).slice(0, 300),
     artist_name: String(track.artist).slice(0, 220),
   });
-  if (track.album) params.set('album_name', String(track.album).slice(0, 220));
+  if (track.catalogAlbum || track.album) params.set('album_name', String(track.catalogAlbum || track.album).slice(0, 220));
   if (Number(track.duration) > 0) params.set('duration', String(Math.round(Number(track.duration))));
-
   return requestJSON(`${LRCLIB_BASE}/get?${params.toString()}`);
 }
 
@@ -80,7 +79,7 @@ async function cacheLyrics(track, { force = false } = {}) {
      RETURNING track_id, title, artist, plain_lyrics, synced_lyrics, provider, fetched_at`,
     [
       track.id,
-      String(track.title).slice(0, 500),
+      String(track.canonicalTitle || track.title).slice(0, 500),
       String(track.artist || '').slice(0, 300) || null,
       data.plainLyrics || null,
       data.syncedLyrics || null,
@@ -122,9 +121,12 @@ async function searchLyrics(query, limit = 10) {
        ) AS lyric_rank
      FROM lyrics_cache l
      JOIN tracks t ON t.id = l.track_id
-     WHERE t.source = 'soundcloud'
-       AND t.metadata->>'catalogVersion' = 'sc-playable-v3'
+     WHERE t.source IN ('audius','soundcloud')
        AND t.metadata->>'streamVerified' = 'true'
+       AND (
+         t.metadata->>'catalogVersion' = 'aleon-unified-v1'
+         OR (t.source = 'soundcloud' AND t.metadata->>'catalogVersion' = 'sc-playable-v3')
+       )
        AND (
          to_tsvector('simple', COALESCE(l.plain_lyrics, '')) @@ websearch_to_tsquery('simple', $1)
          OR LOWER(COALESCE(l.plain_lyrics, '')) LIKE LOWER($2)
@@ -138,7 +140,7 @@ async function searchLyrics(query, limit = 10) {
     const metadata = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
     return {
       id: row.id,
-      externalId: row.external_id || metadata.externalId || '',
+      externalId: row.external_id || '',
       title: row.title || '',
       artist: row.artist || '',
       album: row.album || '',
@@ -147,17 +149,19 @@ async function searchLyrics(query, limit = 10) {
       durationStr: metadata.durationStr || '',
       source: row.source,
       genre: metadata.genre || '',
+      mood: metadata.mood || '',
       permalink: metadata.permalink || '',
       releaseDate: metadata.releaseDate || null,
       playbackCount: Number(metadata.playbackCount || 0),
       likesCount: Number(metadata.likesCount || 0),
       repostsCount: Number(metadata.repostsCount || 0),
-      access: metadata.access || 'playable',
       streamable: true,
       fullStream: true,
       streamVerified: true,
       isPreview: false,
-      providerMode: metadata.providerMode || 'unknown',
+      providerMode: metadata.providerMode || row.source,
+      catalogMatched: metadata.catalogMatched === true,
+      catalogId: metadata.catalogId || null,
       matchReason: 'lyrics',
       lyricRank: Number(row.lyric_rank || 0),
     };
