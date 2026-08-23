@@ -66,6 +66,10 @@ app.use('/api/search',          require('./src/routes/searchV2'));
 app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
 
+app.get('/healthz', (_req, res) => {
+  res.status(200).json({ ok: true, service: 'aleon-api', version: '20' });
+});
+
 app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
