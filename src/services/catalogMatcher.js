@@ -239,9 +239,9 @@ async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = tr
   let audius = audiusInitial;
   let ranked = dedupeAndRank(audius, clean, catalog.tracks, safeLimit);
 
-  // Artist searches often need exact song-title lookups. Resolve only the top canonical
-  // songs, in parallel and in the deep phase, so breadth grows without reintroducing DJ junk.
-  if (includeSoundCloudFallback && ranked.tracks.length < Math.min(16, safeLimit) && catalog.tracks.length) {
+  // Keep expanding with exact Deezer-canonical titles even when SoundCloud is disabled.
+  // This preserves breadth on Audius without reintroducing unstable SoundCloud results.
+  if (ranked.tracks.length < Math.min(16, safeLimit) && catalog.tracks.length) {
     const exactAudius = await resolveCanonicalSeeds(catalog.tracks, 'audius');
     audius = [...audius, ...exactAudius];
     ranked = dedupeAndRank(audius, clean, catalog.tracks, safeLimit);
