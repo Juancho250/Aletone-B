@@ -93,24 +93,24 @@ app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
 
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ ok: true, service: 'aleon-api', version: '20' });
+  res.status(200).json({ ok: true, service: 'aleon-api', version: '21' });
 });
 
 app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'aleon-api',
-    version: '20',
+    version: '21',
     brand: 'ALEON',
     connect: true,
     tasteGraph: 'v2',
     radio: 'v2',
-    search: 'unified-catalog-v1',
+    search: 'audius-playable-v2',
     playback: 'audius-range-v1',
     providers: {
       catalog: 'deezer',
       playbackPrimary: 'audius',
-      playbackFallback: 'soundcloud-canonical-only',
+      playbackFallback: 'soundcloud-legacy-context-only',
     },
   });
 });
@@ -128,16 +128,16 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '20',
+    version: '21',
     brand: 'ALEON',
     connect: true,
     tasteGraph: 'v2',
     radio: 'v2',
-    search: 'unified-catalog-v1',
+    search: 'audius-playable-v2',
     playback: 'audius-range-v1',
     audius: audius.status === 'fulfilled' ? audius.value : { ok: false, error: audius.reason?.message },
     deezer: deezer.status === 'fulfilled' ? deezer.value : { ok: false, error: deezer.reason?.message },
-    soundcloudFallback: { mode: soundCloudMode(), resolver: getStreamResolverStats() },
+    soundcloudFallback: { mode: soundCloudMode(), scope: 'legacy-context-only', resolver: getStreamResolverStats() },
     database: dbCheck.status === 'fulfilled' ? dbCheck.value : { ok: false, error: dbCheck.reason?.message },
     ts: new Date().toISOString(),
   });
@@ -154,12 +154,12 @@ let server;
 initDB()
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`ALEON API v20 corriendo en puerto ${PORT} · Audius primary · Deezer catalog`);
+      console.log(`ALEON API v21 corriendo en puerto ${PORT} · Audius search/playback · Deezer catalog`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
 
-    // SoundCloud is now a canonical-only fallback. Warming it must never delay startup.
+    // SoundCloud remains available only for legacy/context fallbacks. Warming it must never delay startup.
     warmSoundCloud().catch(error => console.warn('[SC fallback] Precarga omitida:', error.message));
   })
   .catch(error => {
