@@ -51,12 +51,7 @@ function similarity(a, b) {
 }
 
 const NOISE_PATTERNS = [
-  /\bdj\b/i,
-  /\bremix\b/i,
-  /\bbootleg\b/i,
-  /\bmashup\b/i,
-  /\bedit\b/i,
-  /\bextended\b/i,
+  /\bdj\b/i, /\bremix\b/i, /\bbootleg\b/i, /\bmashup\b/i, /\bedit\b/i, /\bextended\b/i,
   /\bfree\s*download\b|\bdescarga\s*gratis\b/i,
   /\bsped\s*up\b|\bslowed\b|\breverb\b|\bnightcore\b/i,
   /\bcover\b|\bkaraoke\b|\binstrumental\b/i,
@@ -96,14 +91,8 @@ function canonicalMatch(track, canonicalTracks) {
   const sourceTitle = cleanTitle(track.title, track.artist || track.uploader);
   let best = null;
   for (const canonical of canonicalTracks || []) {
-    const artistSim = Math.max(
-      similarity(track.artist, canonical.artist),
-      similarity(track.uploader, canonical.artist)
-    );
-    const titleSim = Math.max(
-      similarity(sourceTitle, canonical.titleShort || canonical.title),
-      similarity(sourceTitle, canonical.title)
-    );
+    const artistSim = Math.max(similarity(track.artist, canonical.artist), similarity(track.uploader, canonical.artist));
+    const titleSim = Math.max(similarity(sourceTitle, canonical.titleShort || canonical.title), similarity(sourceTitle, canonical.title));
     const sourceDuration = Number(track.duration || 0);
     const targetDuration = Number(canonical.duration || 0);
     const durationDelta = sourceDuration && targetDuration ? Math.abs(sourceDuration - targetDuration) : 0;
@@ -155,17 +144,14 @@ function providerScore(track, query, canonicalTracks, artistMode) {
   score += Math.min(32, Math.log10(Number(track.playbackCount || 0) + 1) * 4.5);
   score += Math.min(14, Math.log10(Number(track.likesCount || 0) + 1) * 2.3);
 
-  let accepted = true;
+  let accepted;
   if (track.source === 'soundcloud') {
-    // SoundCloud is fallback only: it must map to a canonical catalog song.
     accepted = Boolean(match && match.score >= 0.82 && match.artistSim >= 0.78 && match.titleSim >= 0.78);
   } else if (artistMode) {
-    // Artist searches should not surface unrelated Audius uploads.
     accepted = artistModeSimilarity >= 0.9 || Boolean(match && match.score >= 0.78);
   } else {
     accepted = Boolean(match && match.score >= 0.72) || artistQuerySimilarity >= 0.88 || similarity(title, q) >= 0.88;
   }
-
   return { accepted, score, match };
 }
 
@@ -199,6 +185,45 @@ function dedupeAndRank(candidates, query, canonicalTracks, limit) {
   return { tracks: output, artistMode };
 }
 
+async function mapWithConcurrency(items, concurrency, worker) {
+  const queue = [...items];
+  const output = [];
+  const runners = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    while (queue.length) {
+      const item = queue.shift();
+      try {
+        const value = await worker(item);
+        if (Array.isArray(value)) output.push(...value);
+      } catch (_) {}
+    }
+  });
+  await Promise.all(runners);
+  return output;
+}
+
+function canonicalSeeds(catalogTracks, max = 8) {
+  const seen = new Set();
+  return [...(catalogTracks || [])]
+    .sort((a, b) => Number(b.rank || 0) - Number(a.rank || 0))
+    .filter(track => {
+      const key = `${fold(track.titleShort || track.title)}|${fold(track.artist)}`;
+      if (!track.title || !track.artist || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, max);
+}
+
+async function resolveCanonicalSeeds(catalogTracks, provider) {
+  const seeds = canonicalSeeds(catalogTracks, 8);
+  if (!seeds.length) return [];
+  return mapWithConcurrency(seeds, 4, async seed => {
+    const exact = `${seed.artist} ${seed.titleShort || seed.title}`;
+    if (provider === 'audius') return audiusSearchTracks(exact, 8);
+    return scSearch(exact, 8);
+  });
+}
+
 async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = true } = {}) {
   const clean = String(query || '').trim().replace(/\s+/g, ' ').slice(0, 180);
   const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 40);
@@ -206,16 +231,30 @@ async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = tr
   const cached = searchCache.get(cacheKey);
   if (cached && Date.now() - cached.at < SEARCH_CACHE_MS) return { ...cached.value, cached: true };
 
-  const [catalog, audius] = await Promise.all([
+  const [catalog, audiusInitial] = await Promise.all([
     searchCatalog(clean, Math.min(50, Math.max(30, safeLimit + 15))).catch(() => ({ tracks: [], artists: [], albums: [] })),
     audiusSearchTracks(clean, Math.min(50, Math.max(30, safeLimit + 15))).catch(() => []),
   ]);
 
+  let audius = audiusInitial;
   let ranked = dedupeAndRank(audius, clean, catalog.tracks, safeLimit);
+
+  // Artist searches often need exact song-title lookups. Resolve only the top canonical
+  // songs, in parallel and in the deep phase, so breadth grows without reintroducing DJ junk.
+  if (includeSoundCloudFallback && ranked.tracks.length < Math.min(16, safeLimit) && catalog.tracks.length) {
+    const exactAudius = await resolveCanonicalSeeds(catalog.tracks, 'audius');
+    audius = [...audius, ...exactAudius];
+    ranked = dedupeAndRank(audius, clean, catalog.tracks, safeLimit);
+  }
+
   let soundcloud = [];
-  if (includeSoundCloudFallback && ranked.tracks.length < Math.min(12, safeLimit) && catalog.tracks.length) {
-    soundcloud = await scSearch(clean, Math.min(50, Math.max(30, safeLimit + 15))).catch(() => []);
-    ranked = dedupeAndRank([...ranked.tracks, ...soundcloud], clean, catalog.tracks, safeLimit);
+  if (includeSoundCloudFallback && ranked.tracks.length < Math.min(14, safeLimit) && catalog.tracks.length) {
+    const [broadSc, exactSc] = await Promise.all([
+      scSearch(clean, Math.min(50, Math.max(30, safeLimit + 15))).catch(() => []),
+      resolveCanonicalSeeds(catalog.tracks, 'soundcloud').catch(() => []),
+    ]);
+    soundcloud = [...broadSc, ...exactSc];
+    ranked = dedupeAndRank([...audius, ...soundcloud], clean, catalog.tracks, safeLimit);
   }
 
   const value = {
@@ -235,12 +274,4 @@ async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = tr
   return value;
 }
 
-module.exports = {
-  fold,
-  similarity,
-  cleanTitle,
-  isNoisy,
-  canonicalMatch,
-  detectArtistMode,
-  unifiedSearch,
-};
+module.exports = { fold, similarity, cleanTitle, isNoisy, canonicalMatch, detectArtistMode, unifiedSearch };
