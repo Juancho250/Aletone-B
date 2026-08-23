@@ -3,7 +3,11 @@ const path = require('path');
 const router = require('express').Router();
 const { resolveSoundCloudStream, getStreamResolverStats } = require('../services/streamResolver');
 const { deezerTrackUrl } = require('../services/deezer');
-const { proxyTrackStream: proxyAudiusStream, downloadTrackToFile: downloadAudiusTrack } = require('../providers/audius');
+const {
+  proxyTrackStream: proxyAudiusStream,
+  downloadTrackToFile: downloadAudiusTrack,
+  getTrack: getAudiusTrack,
+} = require('../providers/audius');
 const { pipeAudio, downloadAudio } = require('../services/ffmpeg');
 const { sanitize } = require('../utils/helpers');
 
@@ -55,7 +59,6 @@ async function resolveAudioSource(trackId) {
     return { ...info, source: 'soundcloud', nativeProxy: false };
   }
 
-  // Deezer público solo se mantiene como compatibilidad histórica de previews.
   const url = await deezerTrackUrl(trackId);
   return {
     url,
@@ -80,8 +83,6 @@ router.get('/url/:trackId', async (req, res) => {
     const trackId = assertTrackId(req.params.trackId);
     const audio = await resolveAudioSource(trackId);
 
-    // Audius stays behind ALEON's backend so a future API key never reaches the browser.
-    // The /:trackId route passes Range straight through, so seek/start-up stay fast.
     if (trackId.startsWith('au_')) {
       return res.json({
         url: `/api/stream/${encodeURIComponent(trackId)}`,
@@ -130,6 +131,15 @@ router.post('/download', async (req, res) => {
     }
 
     if (videoId.startsWith('au_')) {
+      // Streaming permission and download permission are different in Audius.
+      // Respect the artist's downloadable flag before persisting an offline file.
+      const track = await getAudiusTrack(videoId);
+      if (!track?.downloadable) {
+        return res.status(409).json({
+          error: 'El artista permite reproducir esta canción, pero no descargarla para uso offline.',
+          code: 'OFFLINE_NOT_ALLOWED',
+        });
+      }
       await downloadAudiusTrack(videoId, filepath);
     } else {
       const audio = await resolveAudioSource(videoId);
@@ -150,7 +160,7 @@ router.post('/download', async (req, res) => {
   } catch (error) {
     console.error('[download]', error.message);
     return res.status(error.status || 500).json({
-      error: error.status === 400 ? error.message : 'No fue posible preparar la descarga',
+      error: error.status === 400 ? error.message : (error.message || 'No fue posible preparar la descarga'),
     });
   }
 });
@@ -158,17 +168,11 @@ router.post('/download', async (req, res) => {
 router.get('/:trackId', async (req, res) => {
   try {
     const trackId = assertTrackId(req.params.trackId);
-    if (trackId.startsWith('au_')) {
-      return proxyAudiusStream(trackId, req, res);
-    }
+    if (trackId.startsWith('au_')) return proxyAudiusStream(trackId, req, res);
 
     res.setHeader('Cache-Control', 'no-store');
     const audio = await resolveAudioSource(trackId);
-    if (!audio.proxyRequired) {
-      // This endpoint is only a fallback for direct sources. Redirecting avoids
-      // transcoding a progressive MP3 unnecessarily.
-      return res.redirect(307, audio.url);
-    }
+    if (!audio.proxyRequired) return res.redirect(307, audio.url);
     return pipeAudio(audio.url, res, req);
   } catch (error) {
     console.error('[stream]', error.message);
