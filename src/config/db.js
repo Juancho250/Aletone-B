@@ -86,11 +86,24 @@ async function initDB() {
       consumed_at      TIMESTAMPTZ
     );
 
+    CREATE TABLE IF NOT EXISTS lyrics_cache (
+      track_id       TEXT PRIMARY KEY,
+      title          TEXT NOT NULL,
+      artist         TEXT,
+      plain_lyrics   TEXT,
+      synced_lyrics  TEXT,
+      provider       TEXT NOT NULL DEFAULT 'lrclib',
+      fetched_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id);
     CREATE INDEX IF NOT EXISTS idx_history_played ON history(played_at DESC);
     CREATE INDEX IF NOT EXISTS idx_playlist_user ON playlists(user_id);
     CREATE INDEX IF NOT EXISTS idx_devices_user_seen ON devices(user_id, last_seen DESC);
     CREATE INDEX IF NOT EXISTS idx_device_commands_pending ON device_commands(target_device_id, consumed_at, created_at);
+    CREATE INDEX IF NOT EXISTS idx_lyrics_title_artist ON lyrics_cache(LOWER(title), LOWER(artist));
+    CREATE INDEX IF NOT EXISTS idx_lyrics_plain_fts
+      ON lyrics_cache USING GIN (to_tsvector('simple', COALESCE(plain_lyrics, '')));
   `);
   console.log('[DB] Tablas listas');
 }
