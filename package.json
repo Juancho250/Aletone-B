@@ -1,6 +1,6 @@
 {
-  "name": "aleon-backend",
-  "version": "2.0.0",
+  "name": "musicloud-backend",
+  "version": "1.0.0",
   "description": "ALEON API — unified music catalog, playback, radio, offline and Connect",
   "main": "server.js",
   "scripts": {
