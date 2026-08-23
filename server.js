@@ -60,6 +60,9 @@ app.use('/api/recommendations', require('./src/routes/recommendations'));
 app.use('/api/radio',           require('./src/routes/radio'));
 app.use('/api/saved',           require('./src/routes/saved'));
 app.use('/api/search-history',  require('./src/routes/searchHistory'));
+// La búsqueda estricta intercepta / y /fast. El router anterior queda detrás para
+// /suggest y como fallback de búsqueda por letras o indisponibilidad temporal.
+app.use('/api/search',          require('./src/routes/searchStrict'));
 app.use('/api/search',          require('./src/routes/search'));
 app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
@@ -68,11 +71,11 @@ app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'aletone-api',
-    version: '18',
+    version: '19',
     connect: true,
     tasteGraph: 'v1',
     radio: 'v1',
-    search: 'canonical-instant-v1',
+    search: 'strict-canonical-v2',
     playback: 'low-latency-v1',
     soundcloudMode: soundCloudMode(),
   });
@@ -90,11 +93,11 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '18',
+    version: '19',
     connect: true,
     tasteGraph: 'v1',
     radio: 'v1',
-    search: 'canonical-instant-v1',
+    search: 'strict-canonical-v2',
     playback: 'low-latency-v1',
     streamResolver: getStreamResolverStats(),
     soundcloud: sc.status === 'fulfilled'
@@ -118,7 +121,7 @@ initDB()
   .then(() => warmSoundCloud().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`Aletone API v18 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
+      console.log(`Aletone API v19 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
