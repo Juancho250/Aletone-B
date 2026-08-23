@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const { initDB } = require('./src/config/db');
 const { warmSoundCloud, soundCloudMode } = require('./src/services/soundcloud');
+const { providerStatus: audiusStatus, trendingTracks: audiusTrending } = require('./src/providers/audius');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -28,7 +29,8 @@ const corsOptions = {
     callback(new Error('Origen no permitido por CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Range'],
+  exposedHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges'],
   maxAge: 86400,
 };
 
@@ -56,28 +58,30 @@ app.use('/downloads', express.static(path.join(__dirname, 'downloads'), {
 app.use('/api/auth',            require('./src/routes/auth'));
 app.use('/api/playlists',       require('./src/routes/playlists'));
 app.use('/api/history',         require('./src/routes/history'));
-app.use('/api/recommendations', require('./src/routes/recommendations'));
-app.use('/api/radio',           require('./src/routes/radio'));
+app.use('/api/recommendations', require('./src/routes/recommendationsV2'));
+app.use('/api/radio',           require('./src/routes/radioV2'));
 app.use('/api/saved',           require('./src/routes/saved'));
 app.use('/api/search-history',  require('./src/routes/searchHistory'));
-// La búsqueda estricta intercepta / y /fast. El router anterior queda detrás para
-// /suggest y como fallback de búsqueda por letras o indisponibilidad temporal.
-app.use('/api/search',          require('./src/routes/searchStrict'));
-app.use('/api/search',          require('./src/routes/search'));
+app.use('/api/search',          require('./src/routes/searchV2'));
 app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
 
 app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
-    service: 'aletone-api',
-    version: '19',
+    service: 'aleon-api',
+    version: '20',
+    brand: 'ALEON',
     connect: true,
-    tasteGraph: 'v1',
-    radio: 'v1',
-    search: 'strict-canonical-v2',
-    playback: 'low-latency-v1',
-    soundcloudMode: soundCloudMode(),
+    tasteGraph: 'v2',
+    radio: 'v2',
+    search: 'unified-catalog-v1',
+    playback: 'audius-range-v1',
+    providers: {
+      catalog: 'deezer',
+      playbackPrimary: 'audius',
+      playbackFallback: 'soundcloud-canonical-only',
+    },
   });
 });
 
@@ -85,25 +89,25 @@ app.get('/api/health', async (_req, res) => {
   const { db } = require('./src/config/db');
   const { fetchJSON } = require('./src/utils/helpers');
   const { getStreamResolverStats } = require('./src/services/streamResolver');
-  const [sc, dz, dbCheck] = await Promise.allSettled([
-    warmSoundCloud(),
+
+  const [audius, deezer, dbCheck] = await Promise.allSettled([
+    audiusTrending(1).then(rows => ({ ...audiusStatus(), results: rows.length })),
     fetchJSON('https://api.deezer.com/search?q=test&limit=1').then(data => ({ ok: true, results: data.data?.length || 0 })),
     db.one('SELECT COUNT(*)::int AS n FROM users').then(row => ({ ok: true, users: row?.n || 0 })),
   ]);
 
   res.json({
     ok: true,
-    version: '19',
+    version: '20',
+    brand: 'ALEON',
     connect: true,
-    tasteGraph: 'v1',
-    radio: 'v1',
-    search: 'strict-canonical-v2',
-    playback: 'low-latency-v1',
-    streamResolver: getStreamResolverStats(),
-    soundcloud: sc.status === 'fulfilled'
-      ? sc.value
-      : { ok: false, mode: soundCloudMode(), error: sc.reason?.message },
-    deezer: dz.status === 'fulfilled' ? dz.value : { ok: false, error: dz.reason?.message },
+    tasteGraph: 'v2',
+    radio: 'v2',
+    search: 'unified-catalog-v1',
+    playback: 'audius-range-v1',
+    audius: audius.status === 'fulfilled' ? audius.value : { ok: false, error: audius.reason?.message },
+    deezer: deezer.status === 'fulfilled' ? deezer.value : { ok: false, error: deezer.reason?.message },
+    soundcloudFallback: { mode: soundCloudMode(), resolver: getStreamResolverStats() },
     database: dbCheck.status === 'fulfilled' ? dbCheck.value : { ok: false, error: dbCheck.reason?.message },
     ts: new Date().toISOString(),
   });
@@ -118,13 +122,15 @@ app.use((err, _req, res, next) => {
 
 let server;
 initDB()
-  .then(() => warmSoundCloud().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`Aletone API v19 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
+      console.log(`ALEON API v20 corriendo en puerto ${PORT} · Audius primary · Deezer catalog`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
+
+    // SoundCloud is now a canonical-only fallback. Warming it must never delay startup.
+    warmSoundCloud().catch(error => console.warn('[SC fallback] Precarga omitida:', error.message));
   })
   .catch(error => {
     console.error('[FATAL] No se pudo conectar a la DB:', error.message);
@@ -132,7 +138,7 @@ initDB()
   });
 
 function shutdown(signal) {
-  console.log(`[${signal}] Cerrando Aletone API…`);
+  console.log(`[${signal}] Cerrando ALEON API…`);
   if (!server) process.exit(0);
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 10_000).unref();
