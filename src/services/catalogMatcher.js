@@ -1,6 +1,7 @@
 const { searchTracks: audiusSearchTracks } = require('../providers/audius');
 const { searchCatalog } = require('../providers/deezerCatalog');
 const { scSearch } = require('./soundcloud');
+const { resolveSoundCloudStream } = require('./streamResolver');
 
 const SEARCH_CACHE_MS = 90_000;
 const searchCache = new Map();
@@ -146,7 +147,7 @@ function providerScore(track, query, canonicalTracks, artistMode) {
 
   let accepted;
   if (track.source === 'soundcloud') {
-    accepted = Boolean(match && match.score >= 0.82 && match.artistSim >= 0.78 && match.titleSim >= 0.78);
+    accepted = Boolean(match && match.score >= 0.86 && match.artistSim >= 0.82 && match.titleSim >= 0.82 && match.durationDelta <= 20);
   } else if (artistMode) {
     accepted = artistModeSimilarity >= 0.9 || Boolean(match && match.score >= 0.78);
   } else {
@@ -201,7 +202,7 @@ async function mapWithConcurrency(items, concurrency, worker) {
   return output;
 }
 
-function canonicalSeeds(catalogTracks, max = 8) {
+function canonicalSeeds(catalogTracks, max = 14) {
   const seen = new Set();
   return [...(catalogTracks || [])]
     .sort((a, b) => Number(b.rank || 0) - Number(a.rank || 0))
@@ -215,19 +216,39 @@ function canonicalSeeds(catalogTracks, max = 8) {
 }
 
 async function resolveCanonicalSeeds(catalogTracks, provider) {
-  const seeds = canonicalSeeds(catalogTracks, 8);
+  const seeds = canonicalSeeds(catalogTracks, provider === 'audius' ? 14 : 10);
   if (!seeds.length) return [];
-  return mapWithConcurrency(seeds, 4, async seed => {
+  return mapWithConcurrency(seeds, provider === 'audius' ? 6 : 5, async seed => {
     const exact = `${seed.artist} ${seed.titleShort || seed.title}`;
     if (provider === 'audius') return audiusSearchTracks(exact, 8);
     return scSearch(exact, 8);
   });
 }
 
+async function verifySoundCloudCandidates(candidates, limit = 12) {
+  const selected = (candidates || []).filter(track => track?.source === 'soundcloud').slice(0, limit);
+  if (!selected.length) return [];
+  return mapWithConcurrency(selected, 5, async track => {
+    try {
+      const stream = await resolveSoundCloudStream(track.id);
+      return [{
+        ...track,
+        streamVerified: true,
+        playbackVerified: true,
+        playbackVerifiedAt: Date.now(),
+        protocol: stream?.protocol || null,
+        mimeType: stream?.mimeType || null,
+      }];
+    } catch (_) {
+      return [];
+    }
+  });
+}
+
 async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = true } = {}) {
   const clean = String(query || '').trim().replace(/\s+/g, ' ').slice(0, 180);
   const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 40);
-  const cacheKey = `${fold(clean)}|${safeLimit}|${includeSoundCloudFallback ? 1 : 0}`;
+  const cacheKey = `${fold(clean)}|${safeLimit}|${includeSoundCloudFallback ? 1 : 0}|verified-sc-v1`;
   const cached = searchCache.get(cacheKey);
   if (cached && Date.now() - cached.at < SEARCH_CACHE_MS) return { ...cached.value, cached: true };
 
@@ -239,22 +260,21 @@ async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = tr
   let audius = audiusInitial;
   let ranked = dedupeAndRank(audius, clean, catalog.tracks, safeLimit);
 
-  // Keep expanding with exact Deezer-canonical titles even when SoundCloud is disabled.
-  // This preserves breadth on Audius without reintroducing unstable SoundCloud results.
   if (ranked.tracks.length < Math.min(16, safeLimit) && catalog.tracks.length) {
     const exactAudius = await resolveCanonicalSeeds(catalog.tracks, 'audius');
     audius = [...audius, ...exactAudius];
     ranked = dedupeAndRank(audius, clean, catalog.tracks, safeLimit);
   }
 
-  let soundcloud = [];
+  let verifiedSoundCloud = [];
   if (includeSoundCloudFallback && ranked.tracks.length < Math.min(14, safeLimit) && catalog.tracks.length) {
     const [broadSc, exactSc] = await Promise.all([
-      scSearch(clean, Math.min(50, Math.max(30, safeLimit + 15))).catch(() => []),
+      scSearch(clean, Math.min(36, Math.max(24, safeLimit))).catch(() => []),
       resolveCanonicalSeeds(catalog.tracks, 'soundcloud').catch(() => []),
     ]);
-    soundcloud = [...broadSc, ...exactSc];
-    ranked = dedupeAndRank([...audius, ...soundcloud], clean, catalog.tracks, safeLimit);
+    const canonicalSc = dedupeAndRank([...broadSc, ...exactSc], clean, catalog.tracks, 18).tracks;
+    verifiedSoundCloud = await verifySoundCloudCandidates(canonicalSc, 12);
+    ranked = dedupeAndRank([...audius, ...verifiedSoundCloud], clean, catalog.tracks, safeLimit);
   }
 
   const value = {
@@ -266,7 +286,7 @@ async function unifiedSearch(query, limit = 30, { includeSoundCloudFallback = tr
     providers: {
       catalog: 'deezer',
       playbackPrimary: 'audius',
-      playbackFallback: soundcloud.length ? 'soundcloud' : null,
+      playbackFallback: verifiedSoundCloud.length ? 'soundcloud-verified' : null,
     },
     cached: false,
   };
