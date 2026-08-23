@@ -56,16 +56,61 @@ function albumFrom(track) {
   };
 }
 
+function dedupeTracks(items, limit = 50) {
+  const seen = new Set();
+  const output = [];
+  for (const track of items || []) {
+    if (!track?.catalogId || !track.title) continue;
+    const key = `${fold(track.titleShort || track.title)}|${fold(track.artist)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(track);
+    if (output.length >= limit) break;
+  }
+  return output;
+}
+
+function exactArtistCandidate(tracks, query) {
+  const q = fold(query);
+  if (!q) return null;
+  const counts = new Map();
+  const firstByArtist = new Map();
+  for (const track of tracks || []) {
+    const artistKey = fold(track.artist);
+    if (!artistKey) continue;
+    counts.set(artistKey, (counts.get(artistKey) || 0) + 1);
+    if (!firstByArtist.has(artistKey)) firstByArtist.set(artistKey, track);
+  }
+  const exact = [...counts.entries()]
+    .filter(([artistKey, count]) => artistKey === q && count >= 2)
+    .sort((a, b) => b[1] - a[1])[0];
+  if (!exact) return null;
+  return firstByArtist.get(exact[0]) || null;
+}
+
 async function searchCatalog(query, limit = 30) {
   const clean = String(query || '').trim().replace(/\s+/g, ' ').slice(0, 180);
   if (!clean) return { tracks: [], artists: [], albums: [] };
   const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 50);
-  const key = `${fold(clean)}|${safeLimit}`;
+  const key = `${fold(clean)}|${safeLimit}|artist-top-v1`;
   const cached = cache.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
 
   const data = await fetchJSON(`${BASE}/search?q=${encodeURIComponent(clean)}&limit=${safeLimit}&output=json`);
-  const tracks = (data.data || []).map(trackFrom).filter(Boolean);
+  const genericTracks = (data.data || []).map(trackFrom).filter(Boolean);
+
+  let tracks = genericTracks;
+  const artistCandidate = exactArtistCandidate(genericTracks, clean);
+  if (artistCandidate?.artistId) {
+    try {
+      const top = await fetchJSON(`${BASE}/artist/${encodeURIComponent(artistCandidate.artistId)}/top?limit=50&output=json`);
+      const topTracks = (top.data || []).map(trackFrom).filter(Boolean);
+      tracks = dedupeTracks([...topTracks, ...genericTracks], 50);
+    } catch (_) {
+      tracks = genericTracks;
+    }
+  }
+
   const artistMap = new Map();
   const albumMap = new Map();
   for (const track of tracks) {
@@ -82,7 +127,7 @@ async function searchCatalog(query, limit = 30) {
   }
 
   const value = {
-    tracks,
+    tracks: dedupeTracks(tracks, artistCandidate ? 50 : safeLimit),
     artists: [...artistMap.values()].slice(0, 10),
     albums: [...albumMap.values()].slice(0, 12),
   };
