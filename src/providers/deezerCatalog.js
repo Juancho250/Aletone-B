@@ -90,28 +90,57 @@ async function searchCatalog(query, limit = 30) {
   return value;
 }
 
+function suggestionScore(value, query, type, popularity = 0) {
+  const text = fold(value);
+  const q = fold(query);
+  let score = 0;
+  if (text === q) score += 500;
+  else if (text.startsWith(q)) score += 330;
+  else if (text.includes(q)) score += 220;
+  else if (q.includes(text) && text.length >= 3) score += 160;
+  if (type === 'track') score += 45;
+  if (type === 'artist') score += 30;
+  score += Math.min(40, Math.log10(Math.max(0, Number(popularity || 0)) + 1) * 5);
+  return score;
+}
+
 async function searchSuggestions(query, limit = 8) {
-  const result = await searchCatalog(query, Math.max(12, limit * 2));
-  const suggestions = [];
+  const result = await searchCatalog(query, Math.max(18, limit * 3));
+  const rows = [];
+
+  result.tracks.slice(0, 12).forEach(item => rows.push({
+    type: 'track',
+    value: item.title,
+    subtitle: item.artist || 'Canción',
+    thumbnail: item.thumbnail || '',
+    score: suggestionScore(item.titleShort || item.title, query, 'track', item.rank),
+  }));
+  result.artists.slice(0, 8).forEach(item => rows.push({
+    type: 'artist',
+    value: item.name,
+    subtitle: 'Artista',
+    thumbnail: item.thumbnail || '',
+    score: suggestionScore(item.name, query, 'artist'),
+  }));
+  result.albums.slice(0, 8).forEach(item => rows.push({
+    type: 'album',
+    value: item.title,
+    subtitle: item.artist || 'Álbum',
+    thumbnail: item.thumbnail || '',
+    score: suggestionScore(item.title, query, 'album'),
+  }));
+
   const seen = new Set();
-  const push = item => {
-    const key = `${item.type}|${fold(item.value)}`;
-    if (!item.value || seen.has(key)) return;
-    seen.add(key);
-    suggestions.push(item);
-  };
-
-  result.artists.slice(0, 4).forEach(item => push({
-    type: 'artist', value: item.name, subtitle: 'Artista', thumbnail: item.thumbnail || '',
-  }));
-  result.tracks.slice(0, 6).forEach(item => push({
-    type: 'track', value: item.title, subtitle: item.artist || 'Canción', thumbnail: item.thumbnail || '',
-  }));
-  result.albums.slice(0, 4).forEach(item => push({
-    type: 'album', value: item.title, subtitle: item.artist || 'Álbum', thumbnail: item.thumbnail || '',
-  }));
-
-  return suggestions.slice(0, limit);
+  return rows
+    .sort((a, b) => b.score - a.score)
+    .filter(item => {
+      const key = `${item.type}|${fold(item.value)}|${fold(item.subtitle)}`;
+      if (!item.value || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, limit)
+    .map(({ score, ...item }) => item);
 }
 
 module.exports = { BASE, fold, searchCatalog, searchSuggestions };
