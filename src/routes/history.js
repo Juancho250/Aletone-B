@@ -4,6 +4,8 @@ const auth = require('../middleware/auth');
 
 router.use(auth);
 
+const PLAYABLE_CATALOG_VERSION = 'sc-playable-v3';
+
 function nonNegativeInt(value, fallback = 0) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -43,8 +45,6 @@ async function upsertTrack(track) {
   );
 }
 
-// Crea un evento de escucha. El evento se actualiza mientras el usuario oye la
-// canción; así Aletone distingue una reproducción real de un skip de 3 segundos.
 router.post('/', async (req, res) => {
   const {
     track_id, title, artist, album, thumbnail, source, duration,
@@ -75,7 +75,6 @@ router.post('/', async (req, res) => {
       ]
     );
 
-    // Más profundidad que antes para que el perfil musical aprenda a medio plazo.
     db.query(
       `DELETE FROM history
        WHERE user_id = $1
@@ -122,18 +121,36 @@ router.get('/', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
   const tracks = await db.all(
     `SELECT * FROM (
-       SELECT DISTINCT ON (track_id)
-         track_id, title, artist, thumbnail, source, played_at AS last_played,
-         progress_ms, listened_ms, completed
-       FROM history
-       WHERE user_id = $1
-       ORDER BY track_id, played_at DESC
+       SELECT DISTINCT ON (h.track_id)
+         h.track_id,
+         COALESCE(t.title, h.title) AS title,
+         COALESCE(t.artist, h.artist) AS artist,
+         COALESCE(t.thumbnail, h.thumbnail) AS thumbnail,
+         COALESCE(t.source, h.source) AS source,
+         t.album,
+         t.duration,
+         h.played_at AS last_played,
+         h.progress_ms,
+         h.listened_ms,
+         h.completed,
+         COALESCE((t.metadata->>'streamVerified')::boolean, FALSE) AS stream_verified
+       FROM history h
+       LEFT JOIN tracks t ON t.id = h.track_id
+       WHERE h.user_id = $1
+         AND (
+           COALESCE(t.source, h.source) <> 'soundcloud'
+           OR (
+             t.metadata->>'catalogVersion' = $3
+             AND t.metadata->>'streamVerified' = 'true'
+           )
+         )
+       ORDER BY h.track_id, h.played_at DESC
      ) recent
      ORDER BY last_played DESC
      LIMIT $2`,
-    [req.user.id, limit]
+    [req.user.id, limit, PLAYABLE_CATALOG_VERSION]
   );
-  return res.json({ tracks });
+  return res.json({ tracks, catalogVersion: PLAYABLE_CATALOG_VERSION });
 });
 
 module.exports = router;
