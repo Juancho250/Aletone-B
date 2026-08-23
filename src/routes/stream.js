@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const router = require('express').Router();
-const { scStreamInfo } = require('../services/soundcloud');
+const { resolveSoundCloudStream, getStreamResolverStats } = require('../services/streamResolver');
 const { deezerTrackUrl } = require('../services/deezer');
 const { pipeAudio, downloadAudio } = require('../services/ffmpeg');
 const { sanitize } = require('../utils/helpers');
@@ -39,12 +39,12 @@ async function resolveAudioSource(trackId) {
   assertTrackId(trackId);
 
   if (trackId.startsWith('sc_')) {
-    const info = await scStreamInfo(trackId);
+    const info = await resolveSoundCloudStream(trackId);
     return { ...info, source: 'soundcloud' };
   }
 
-  // La API pública de Deezer solo entrega previews. Se conserva soporte para
-  // elementos históricos, pero nunca se presenta como canción completa.
+  // Deezer público entrega preview. Se conserva para compatibilidad histórica,
+  // pero nunca se presenta como canción completa.
   const url = await deezerTrackUrl(trackId);
   return {
     url,
@@ -62,11 +62,10 @@ function buildDownloadName(trackId, title) {
   return `${safeTitle}-${safeId}.mp3`;
 }
 
-// Resuelve la mejor estrategia de reproducción. Para AAC/HLS SoundCloud el
-// navegador de escritorio no siempre puede reproducir m3u8 directamente, así
-// que indicamos al cliente que use el proxy/transcodificador de Aletone.
+// Resolución ligera. Gracias al streamResolver, si la búsqueda ya precalentó
+// esta canción, esta ruta responde desde memoria sin volver a consultar SoundCloud.
 router.get('/url/:trackId', async (req, res) => {
-  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Cache-Control', 'private, max-age=30');
   try {
     const trackId = assertTrackId(req.params.trackId);
     const audio = await resolveAudioSource(trackId);
@@ -78,10 +77,15 @@ router.get('/url/:trackId', async (req, res) => {
       isPreview: Boolean(audio.isPreview),
       mimeType: audio.mimeType || null,
       protocol: audio.protocol || null,
+      warmed: true,
     });
   } catch (error) {
     return res.status(error.status || 503).json({ error: error.message });
   }
+});
+
+router.get('/resolver/stats', (_req, res) => {
+  res.json(getStreamResolverStats());
 });
 
 router.post('/download', async (req, res) => {
