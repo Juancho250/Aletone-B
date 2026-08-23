@@ -68,11 +68,12 @@ app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'aletone-api',
-    version: '17',
+    version: '18',
     connect: true,
     tasteGraph: 'v1',
     radio: 'v1',
-    search: 'instant-progressive-v1',
+    search: 'canonical-instant-v1',
+    playback: 'low-latency-v1',
     soundcloudMode: soundCloudMode(),
   });
 });
@@ -89,11 +90,12 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '17',
+    version: '18',
     connect: true,
     tasteGraph: 'v1',
     radio: 'v1',
-    search: 'instant-progressive-v1',
+    search: 'canonical-instant-v1',
+    playback: 'low-latency-v1',
     streamResolver: getStreamResolverStats(),
     soundcloud: sc.status === 'fulfilled'
       ? sc.value
@@ -116,7 +118,7 @@ initDB()
   .then(() => warmSoundCloud().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`Aletone API v17 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
+      console.log(`Aletone API v18 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
