@@ -2,8 +2,13 @@ services:
   - type: web
     name: aletone-api
     env: node
-    buildCommand: npm install
-    startCommand: node server.js
+    repo: https://github.com/Juancho250/Aletone-B
+    branch: main
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    autoDeployTrigger: checksPass
+    healthCheckPath: /healthz
+    maxShutdownDelaySeconds: 30
     envVars:
       - key: NODE_ENV
         value: production
