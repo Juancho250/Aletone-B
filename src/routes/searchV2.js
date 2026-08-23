@@ -9,10 +9,14 @@ const responseCache = new Map();
 const suggestionCache = new Map();
 const CACHE_MS = 90_000;
 const SUGGEST_MS = 5 * 60_000;
-const CATALOG_VERSION = 'aleon-unified-v1';
+const CATALOG_VERSION = 'aleon-unified-v2';
 
 function normalizeQuery(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 180);
+}
+
+function isAudiusPlayable(track) {
+  return Boolean(track?.id && (String(track.id).startsWith('au_') || String(track.source || '').toLowerCase() === 'audius'));
 }
 
 function dedupe(items, limit = 30) {
@@ -20,7 +24,7 @@ function dedupe(items, limit = 30) {
   const seenKeys = new Set();
   const output = [];
   for (const item of items || []) {
-    if (!item?.id || !item?.title) continue;
+    if (!item?.id || !item?.title || !isAudiusPlayable(item)) continue;
     const key = `${fold(item.canonicalTitle || item.title)}|${fold(item.artist)}`;
     if (seenIds.has(item.id) || seenKeys.has(key)) continue;
     seenIds.add(item.id);
@@ -32,7 +36,7 @@ function dedupe(items, limit = 30) {
 }
 
 async function saveTracks(tracks) {
-  const valid = (tracks || []).filter(track => track?.id && track?.title && !track.isPreview);
+  const valid = (tracks || []).filter(track => track?.id && track?.title && !track.isPreview && isAudiusPlayable(track));
   if (!valid.length) return;
   await Promise.allSettled(valid.map(track => db.query(
     `INSERT INTO tracks (
@@ -125,18 +129,19 @@ router.get('/fast', async (req, res) => {
 
   try {
     const result = await unifiedSearch(q, limit, { includeSoundCloudFallback: false });
-    saveTracks(result.tracks).then(() => warmLyrics(result.tracks, 3)).catch(() => {});
+    const playable = dedupe(result.tracks, limit);
+    saveTracks(playable).then(() => warmLyrics(playable, 3)).catch(() => {});
     return res.json({
-      results: result.tracks,
+      results: playable,
       artists: result.artists,
       albums: result.albums,
       catalogTracks: result.catalogTracks.slice(0, 20),
       artistMode: result.artistMode || null,
-      providers: result.providers,
+      providers: { ...result.providers, playbackPrimary: 'audius', playbackFallback: null },
       cached: result.cached,
       provisional: false,
       interpretedQuery: q,
-      searchMode: 'aleon-fast-unified',
+      searchMode: 'aleon-fast-audius-only',
     });
   } catch (error) {
     console.warn('[ALEON search fast]', error.message);
@@ -149,20 +154,23 @@ router.get('/', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 40);
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
 
-  const key = `${fold(q)}|${limit}`;
+  const key = `${fold(q)}|${limit}|audius-only-v2`;
   const cached = responseCache.get(key);
   if (cached && Date.now() - cached.at < CACHE_MS) return res.json({ ...cached.value, cached: true });
 
   try {
     const [suggestionData, result] = await Promise.all([
       suggestionsFor(q).catch(() => ({ suggestions: [], correction: null })),
-      unifiedSearch(q, limit, { includeSoundCloudFallback: true }),
+      // Search results shown as playable must be Audius-backed. SoundCloud remains
+      // available to legacy/history flows, but is intentionally excluded here because
+      // public SoundCloud URLs can expire or become unavailable between search and play.
+      unifiedSearch(q, limit, { includeSoundCloudFallback: false }),
     ]);
 
     let lyricResults = [];
     if (q.split(/\s+/).length >= 3) {
       lyricResults = await searchLyrics(q, Math.min(8, limit)).catch(() => []);
-      lyricResults = lyricResults.filter(track => !isNoisy(track, q));
+      lyricResults = lyricResults.filter(track => !isNoisy(track, q) && isAudiusPlayable(track));
     }
 
     const results = dedupe([...result.tracks, ...lyricResults], limit);
@@ -174,20 +182,20 @@ router.get('/', async (req, res) => {
       albums: result.albums,
       catalogTracks: result.catalogTracks.slice(0, 24),
       artistMode: result.artistMode || null,
-      providers: result.providers,
+      providers: { ...result.providers, playbackPrimary: 'audius', playbackFallback: null },
       correction: suggestionData.correction,
       suggestions: suggestionData.suggestions,
       interpretedQuery: suggestionData.correction || q,
       lyricMatches: lyricResults.length,
       cached: result.cached,
-      searchMode: lyricResults.length ? 'aleon-unified+lyrics' : 'aleon-unified',
+      searchMode: lyricResults.length ? 'aleon-audius-only+lyrics' : 'aleon-audius-only',
       availability: {
         playable: results.length,
         catalog: result.catalogTracks.length,
       },
     };
     responseCache.set(key, { at: Date.now(), value });
-    console.log(`[ALEON Search] "${q}" playable:${results.length} catalog:${result.catalogTracks.length} audius-first`);
+    console.log(`[ALEON Search] "${q}" playable:${results.length} catalog:${result.catalogTracks.length} audius-only`);
     return res.json(value);
   } catch (error) {
     console.error('[ALEON Search]', error);
