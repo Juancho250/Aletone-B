@@ -1,7 +1,7 @@
 {
   "name": "musicloud-backend",
   "version": "1.0.0",
-  "description": "Backend API para MusiCloud - reproductor de música personal",
+  "description": "ALEON API — unified music catalog, playback, radio, offline and Connect",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

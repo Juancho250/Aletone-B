@@ -1,73 +1,183 @@
 const fs = require('fs');
 const path = require('path');
 const router = require('express').Router();
-const { scStreamUrl } = require('../services/soundcloud');
+const { resolveSoundCloudStream, getStreamResolverStats } = require('../services/streamResolver');
 const { deezerTrackUrl } = require('../services/deezer');
+const {
+  proxyTrackStream: proxyAudiusStream,
+  downloadTrackToFile: downloadAudiusTrack,
+  getTrack: getAudiusTrack,
+} = require('../providers/audius');
 const { pipeAudio, downloadAudio } = require('../services/ffmpeg');
 const { sanitize } = require('../utils/helpers');
 
 const DOWNLOADS_DIR = path.join(__dirname, '../../downloads');
+const TRACK_ID_RE = /^(?:au|sc|dz)_[A-Za-z0-9_-]{1,180}$/;
+const ONE_DAY_MS = 86_400_000;
+const cleanupTimer = setInterval(cleanOldDownloads, 3_600_000);
+cleanupTimer.unref?.();
+
 if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
 
-setInterval(() => {
-  try {
-    const now = Date.now();
-    fs.readdirSync(DOWNLOADS_DIR).forEach((f) => {
-      const fp = path.join(DOWNLOADS_DIR, f);
-      if (now - fs.statSync(fp).mtimeMs > 86400000) fs.unlinkSync(fp);
-    });
-  } catch (_) {}
-}, 3600000);
-
-async function resolveAudioUrl(trackId) {
-  if (trackId.startsWith('sc_')) return scStreamUrl(trackId);
-  if (trackId.startsWith('dz_')) return deezerTrackUrl(trackId);
-  throw new Error('ID inválido. Usa prefijo sc_ o dz_');
+function assertTrackId(trackId) {
+  if (!TRACK_ID_RE.test(String(trackId || ''))) {
+    const error = new Error('ID de pista inválido');
+    error.status = 400;
+    throw error;
+  }
+  return trackId;
 }
 
-// ✅ 1. PRIMERO: rutas específicas con prefijo fijo
+function cleanOldDownloads() {
+  try {
+    const now = Date.now();
+    fs.readdirSync(DOWNLOADS_DIR).forEach(filename => {
+      const filepath = path.join(DOWNLOADS_DIR, filename);
+      if (now - fs.statSync(filepath).mtimeMs > ONE_DAY_MS) fs.unlinkSync(filepath);
+    });
+  } catch (error) {
+    console.warn('[downloads] Limpieza omitida:', error.message);
+  }
+}
 
-// GET /api/stream/url/:trackId — devuelve la URL directa sin proxy
+async function resolveAudioSource(trackId) {
+  assertTrackId(trackId);
+
+  if (trackId.startsWith('au_')) {
+    return {
+      source: 'audius',
+      protocol: 'progressive',
+      mimeType: 'audio/mpeg',
+      proxyRequired: true,
+      nativeProxy: true,
+      isPreview: false,
+    };
+  }
+
+  if (trackId.startsWith('sc_')) {
+    const info = await resolveSoundCloudStream(trackId);
+    return { ...info, source: 'soundcloud', nativeProxy: false };
+  }
+
+  const url = await deezerTrackUrl(trackId);
+  return {
+    url,
+    source: 'deezer',
+    protocol: 'progressive',
+    mimeType: 'audio/mpeg',
+    proxyRequired: false,
+    nativeProxy: false,
+    isPreview: true,
+  };
+}
+
+function buildDownloadName(trackId, title) {
+  const safeTitle = sanitize(title || 'aleon').slice(0, 90) || 'aleon';
+  const safeId = sanitize(trackId).slice(0, 80) || 'track';
+  return `${safeTitle}-${safeId}.mp3`;
+}
+
 router.get('/url/:trackId', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'private, max-age=60');
   try {
-    const url = await resolveAudioUrl(req.params.trackId);
-    res.json({ url });
-  } catch (e) {
-    res.status(503).json({ error: e.message });
+    const trackId = assertTrackId(req.params.trackId);
+    const audio = await resolveAudioSource(trackId);
+
+    if (trackId.startsWith('au_')) {
+      return res.json({
+        url: `/api/stream/${encodeURIComponent(trackId)}`,
+        mode: 'range-proxy',
+        source: 'audius',
+        isPreview: false,
+        mimeType: 'audio/mpeg',
+        protocol: 'progressive',
+        warmed: true,
+      });
+    }
+
+    return res.json({
+      url: audio.proxyRequired ? `/api/stream/${encodeURIComponent(trackId)}` : audio.url,
+      mode: audio.proxyRequired ? 'proxy' : 'direct',
+      source: audio.source,
+      isPreview: Boolean(audio.isPreview),
+      mimeType: audio.mimeType || null,
+      protocol: audio.protocol || null,
+      warmed: true,
+    });
+  } catch (error) {
+    return res.status(error.status || 503).json({ error: error.message });
   }
 });
 
-// POST /api/stream/download
+router.get('/resolver/stats', (_req, res) => {
+  res.json(getStreamResolverStats());
+});
+
 router.post('/download', async (req, res) => {
-  const { videoId, title, streamUrl: directUrl } = req.body;
-  if (!videoId) return res.status(400).json({ error: 'Falta videoId' });
-
-  const filename = sanitize(title || videoId) + '.mp3';
-  const filepath = path.join(DOWNLOADS_DIR, filename);
-
-  if (fs.existsSync(filepath))
-    return res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
+  const { videoId, title } = req.body || {};
 
   try {
-    const audioUrl = directUrl || (await resolveAudioUrl(videoId));
-    await downloadAudio(audioUrl, filepath);
-    res.json({ success: true, filename, url: `/downloads/${encodeURIComponent(filename)}` });
-  } catch (err) {
-    res.status(500).json({ error: 'Download failed', detail: String(err).substring(0, 200) });
+    assertTrackId(videoId);
+    const filename = buildDownloadName(videoId, title);
+    const filepath = path.join(DOWNLOADS_DIR, filename);
+
+    if (fs.existsSync(filepath)) {
+      return res.json({
+        success: true,
+        filename,
+        url: `/downloads/${encodeURIComponent(filename)}`,
+        cached: true,
+      });
+    }
+
+    if (videoId.startsWith('au_')) {
+      // Streaming permission and download permission are different in Audius.
+      // Respect the artist's downloadable flag before persisting an offline file.
+      const track = await getAudiusTrack(videoId);
+      if (!track?.downloadable) {
+        return res.status(409).json({
+          error: 'El artista permite reproducir esta canción, pero no descargarla para uso offline.',
+          code: 'OFFLINE_NOT_ALLOWED',
+        });
+      }
+      await downloadAudiusTrack(videoId, filepath);
+    } else {
+      const audio = await resolveAudioSource(videoId);
+      if (audio.isPreview) {
+        return res.status(409).json({
+          error: 'Esta fuente solo ofrece un preview y no puede guardarse como canción offline.',
+        });
+      }
+      await downloadAudio(audio.url, filepath);
+    }
+
+    return res.json({
+      success: true,
+      filename,
+      url: `/downloads/${encodeURIComponent(filename)}`,
+      cached: false,
+    });
+  } catch (error) {
+    console.error('[download]', error.message);
+    return res.status(error.status || 500).json({
+      error: error.status === 400 ? error.message : (error.message || 'No fue posible preparar la descarga'),
+    });
   }
 });
 
-// ✅ 2. AL FINAL: la ruta genérica /:trackId (proxy de audio)
 router.get('/:trackId', async (req, res) => {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-cache');
   try {
-    const audioUrl = await resolveAudioUrl(req.params.trackId);
-    pipeAudio(audioUrl, res, req);
-  } catch (e) {
-    console.error('[stream]', e.message);
-    if (!res.headersSent) res.status(503).json({ error: e.message });
+    const trackId = assertTrackId(req.params.trackId);
+    if (trackId.startsWith('au_')) return proxyAudiusStream(trackId, req, res);
+
+    res.setHeader('Cache-Control', 'no-store');
+    const audio = await resolveAudioSource(trackId);
+    if (!audio.proxyRequired) return res.redirect(307, audio.url);
+    return pipeAudio(audio.url, res, req);
+  } catch (error) {
+    console.error('[stream]', error.message);
+    if (!res.headersSent) return res.status(error.status || 503).json({ error: error.message });
+    return undefined;
   }
 });
 
