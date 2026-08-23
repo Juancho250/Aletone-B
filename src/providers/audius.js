@@ -15,10 +15,7 @@ function apiHeaders(extra = {}) {
 }
 
 function withCommonParams(params = {}) {
-  return {
-    app_name: 'ALEON',
-    ...params,
-  };
+  return { app_name: 'ALEON', ...params };
 }
 
 async function requestJSON(path, params = {}, { timeout = DEFAULT_TIMEOUT_MS } = {}) {
@@ -30,11 +27,7 @@ async function requestJSON(path, params = {}, { timeout = DEFAULT_TIMEOUT_MS } =
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      headers: apiHeaders(),
-      redirect: 'follow',
-    });
+    const response = await fetch(url, { signal: controller.signal, headers: apiHeaders(), redirect: 'follow' });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       const error = new Error(payload?.message || payload?.error || `Audius HTTP ${response.status}`);
@@ -48,7 +41,7 @@ async function requestJSON(path, params = {}, { timeout = DEFAULT_TIMEOUT_MS } =
 }
 
 function artworkFrom(track) {
-  const art = track?.artwork || track?.cover_art || track?.coverArt || {};
+  const art = track?.artwork || track?.coverArt || track?.cover_art || {};
   return art?._1000x1000 || art?._480x480 || art?._150x150 || art?.['1000x1000'] || art?.['480x480'] || art?.['150x150'] || '';
 }
 
@@ -56,7 +49,9 @@ function normalizeTrack(track) {
   if (!track?.id) return null;
   const user = track.user || {};
   const duration = Math.max(0, Math.round(Number(track.duration || 0)));
-  const artist = user.name || track.artist_name || user.handle || track.artist || '';
+  const artist = user.name || track.artistName || track.artist_name || user.handle || track.artist || '';
+  const isStreamable = track.isStreamable !== false && track.is_streamable !== false;
+  if (!isStreamable) return null;
 
   return {
     id: `au_${track.id}`,
@@ -65,25 +60,26 @@ function normalizeTrack(track) {
     artist,
     uploader: user.handle || artist,
     artistId: user.id ? String(user.id) : '',
-    album: track.album_name || track.album || '',
+    album: track.albumName || track.album_name || track.album || '',
     genre: track.genre || '',
     mood: track.mood || '',
+    tags: Array.isArray(track.tags) ? track.tags : [],
     duration,
     durationStr: duration ? `${Math.floor(duration / 60)}:${String(duration % 60).padStart(2, '0')}` : '',
     thumbnail: artworkFrom(track),
     source: 'audius',
-    permalink: track.permalink || track.permalink_url || '',
-    releaseDate: track.release_date || track.created_at || null,
-    playbackCount: Number(track.play_count || track.playback_count || 0),
-    likesCount: Number(track.favorite_count || track.likes_count || 0),
-    repostsCount: Number(track.repost_count || track.reposts_count || 0),
-    verifiedUser: Boolean(user.is_verified || user.verified),
+    permalink: track.permalink || track.permalinkUrl || track.permalink_url || '',
+    releaseDate: track.releaseDate || track.release_date || track.createdAt || track.created_at || null,
+    playbackCount: Number(track.playCount || track.play_count || track.playbackCount || track.playback_count || 0),
+    likesCount: Number(track.favoriteCount || track.favorite_count || track.likesCount || track.likes_count || 0),
+    repostsCount: Number(track.repostCount || track.repost_count || track.repostsCount || track.reposts_count || 0),
+    verifiedUser: Boolean(user.isVerified || user.is_verified || user.verified),
+    downloadable: Boolean(track.downloadable),
     streamable: true,
     fullStream: true,
     streamVerified: true,
     isPreview: false,
     providerMode: 'audius',
-    raw: undefined,
   };
 }
 
@@ -94,7 +90,7 @@ function normalizeTracks(value) {
 
 async function searchTracks(query, limit = 30) {
   const safeLimit = Math.min(Math.max(Number(limit) || 30, 1), 50);
-  const data = await requestJSON('/tracks/search', { query, limit: safeLimit });
+  const data = await requestJSON('/tracks/search', { query, limit: safeLimit, sort_method: 'relevant' });
   return normalizeTracks(data);
 }
 
@@ -124,7 +120,7 @@ async function getTrack(trackId) {
 
 function normalizeAutocompleteItem(item, fallbackType = '') {
   const type = String(item?.type || fallbackType || '').toLowerCase();
-  const value = item?.name || item?.title || item?.handle || item?.playlist_name || item?.album_name || '';
+  const value = item?.name || item?.title || item?.handle || item?.playlistName || item?.playlist_name || item?.albumName || item?.album_name || '';
   if (!value) return null;
   const user = item?.user || {};
   const subtitle = type.includes('user') || type === 'artist'
@@ -133,7 +129,7 @@ function normalizeAutocompleteItem(item, fallbackType = '') {
       ? 'Playlist'
       : type.includes('album')
         ? 'Álbum'
-        : (user.name || item?.artist_name || 'Canción');
+        : (user.name || item?.artistName || item?.artist_name || 'Canción');
   return {
     type: type.includes('user') ? 'artist' : type.includes('playlist') ? 'playlist' : type.includes('album') ? 'album' : 'track',
     value,
@@ -166,9 +162,7 @@ async function autocomplete(query, limit = 8) {
     return output.slice(0, safeLimit);
   } catch (_) {
     const tracks = await searchTracks(query, safeLimit).catch(() => []);
-    return tracks.slice(0, safeLimit).map(track => ({
-      type: 'track', value: track.title, subtitle: track.artist || 'Canción', thumbnail: track.thumbnail || '',
-    }));
+    return tracks.slice(0, safeLimit).map(track => ({ type: 'track', value: track.title, subtitle: track.artist || 'Canción', thumbnail: track.thumbnail || '' }));
   }
 }
 
@@ -196,14 +190,9 @@ async function proxyTrackStream(trackId, req, res) {
   const controller = new AbortController();
   const abort = () => controller.abort();
   req.on('aborted', abort);
-  req.on('close', abort);
 
   try {
-    const upstream = await fetchStreamResponse(trackId, {
-      range: req.headers.range || '',
-      signal: controller.signal,
-    });
-
+    const upstream = await fetchStreamResponse(trackId, { range: req.headers.range || '', signal: controller.signal });
     res.status(upstream.status === 206 ? 206 : 200);
     for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
       const value = upstream.headers.get(header);
@@ -212,15 +201,15 @@ async function proxyTrackStream(trackId, req, res) {
     if (!res.getHeader('Content-Type')) res.setHeader('Content-Type', 'audio/mpeg');
     res.setHeader('Cache-Control', 'private, max-age=900');
     res.setHeader('X-Accel-Buffering', 'no');
-
     if (!upstream.body) return res.end();
+
     const stream = Readable.fromWeb(upstream.body);
+    req.on('close', () => { try { stream.destroy(); } catch (_) {} });
     stream.on('error', () => { if (!res.destroyed) res.destroy(); });
     stream.pipe(res);
     return undefined;
   } finally {
     req.off('aborted', abort);
-    req.off('close', abort);
   }
 }
 
@@ -231,11 +220,7 @@ async function downloadTrackToFile(trackId, outputPath) {
 }
 
 function providerStatus() {
-  return {
-    ok: true,
-    mode: process.env.AUDIUS_API_KEY ? 'api-key' : 'public-read',
-    base: BASE,
-  };
+  return { ok: true, mode: process.env.AUDIUS_API_KEY ? 'api-key' : 'public-read', base: BASE };
 }
 
 module.exports = {
