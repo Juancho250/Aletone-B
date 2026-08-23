@@ -93,19 +93,19 @@ app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
 
 app.get('/healthz', (_req, res) => {
-  res.status(200).json({ ok: true, service: 'aleon-api', version: '22' });
+  res.status(200).json({ ok: true, service: 'aleon-api', version: '23' });
 });
 
 app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'aleon-api',
-    version: '22',
+    version: '23',
     brand: 'ALEON',
     connect: true,
     tasteGraph: 'v2',
     radio: 'v2',
-    search: 'verified-hybrid-v1',
+    search: 'canonical-first-v1',
     playback: 'audius+verified-soundcloud',
     providers: {
       catalog: 'deezer',
@@ -128,12 +128,12 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '22',
+    version: '23',
     brand: 'ALEON',
     connect: true,
     tasteGraph: 'v2',
     radio: 'v2',
-    search: 'verified-hybrid-v1',
+    search: 'canonical-first-v1',
     playback: 'audius+verified-soundcloud',
     audius: audius.status === 'fulfilled' ? audius.value : { ok: false, error: audius.reason?.message },
     deezer: deezer.status === 'fulfilled' ? deezer.value : { ok: false, error: deezer.reason?.message },
@@ -154,7 +154,7 @@ let server;
 initDB()
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`ALEON API v22 corriendo en puerto ${PORT} · Audius primary · verified SoundCloud fallback · Deezer catalog`);
+      console.log(`ALEON API v23 corriendo en puerto ${PORT} · canonical Deezer search · Audius primary · verified SoundCloud fallback`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
