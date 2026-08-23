@@ -7,9 +7,9 @@ const { searchLyrics, warmLyrics } = require('../services/lyrics');
 
 const responseCache = new Map();
 const suggestionCache = new Map();
-const CACHE_MS = 90_000;
+const CACHE_MS = 3 * 60_000;
 const SUGGEST_MS = 5 * 60_000;
-const CATALOG_VERSION = 'aleon-unified-v3';
+const CATALOG_VERSION = 'aleon-canonical-first-v4';
 
 function normalizeQuery(value) {
   return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 180);
@@ -29,7 +29,7 @@ function dedupe(items, limit = 30) {
   const output = [];
   for (const item of items || []) {
     if (!item?.id || !item?.title || !isSearchPlayable(item)) continue;
-    const key = `${fold(item.canonicalTitle || item.title)}|${fold(item.artist)}`;
+    const key = `${fold(item.catalogId || '')}|${fold(item.canonicalTitle || item.title)}|${fold(item.artist)}`;
     if (seenIds.has(item.id) || seenKeys.has(key)) continue;
     seenIds.add(item.id);
     seenKeys.add(key);
@@ -133,20 +133,23 @@ router.get('/fast', async (req, res) => {
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
 
   try {
-    const result = await unifiedSearch(q, limit, { includeSoundCloudFallback: false });
+    // Fast pass: canonical Deezer catalog + already-obvious Audius matches only.
+    // The UI can render the official catalog immediately while the deep pass resolves audio.
+    const result = await unifiedSearch(q, limit, { includeSoundCloudFallback: false, quick: true });
     const playable = dedupe(result.tracks, limit);
     saveTracks(playable).then(() => warmLyrics(playable, 3)).catch(() => {});
     return res.json({
       results: playable,
       artists: result.artists,
       albums: result.albums,
-      catalogTracks: result.catalogTracks.slice(0, 24),
+      catalogTracks: result.catalogTracks.slice(0, 30),
       artistMode: result.artistMode || null,
       providers: { ...result.providers, playbackPrimary: 'audius', playbackFallback: null },
       cached: result.cached,
       provisional: true,
       interpretedQuery: q,
-      searchMode: 'aleon-fast-audius',
+      searchMode: 'aleon-fast-canonical-v1',
+      availability: { playable: playable.length, catalog: result.catalogTracks.length },
     });
   } catch (error) {
     console.warn('[ALEON search fast]', error.message);
@@ -159,14 +162,14 @@ router.get('/', async (req, res) => {
   const limit = Math.min(Math.max(Number(req.query.limit) || 30, 1), 40);
   if (!q) return res.status(400).json({ error: 'Falta el parámetro q' });
 
-  const key = `${fold(q)}|${limit}|verified-fallback-v3`;
+  const key = `${fold(q)}|${limit}|canonical-first-v4`;
   const cached = responseCache.get(key);
   if (cached && Date.now() - cached.at < CACHE_MS) return res.json({ ...cached.value, cached: true });
 
   try {
     const [suggestionData, result] = await Promise.all([
       suggestionsFor(q).catch(() => ({ suggestions: [], correction: null })),
-      unifiedSearch(q, limit, { includeSoundCloudFallback: true }),
+      unifiedSearch(q, limit, { includeSoundCloudFallback: true, quick: false }),
     ]);
 
     let lyricResults = [];
@@ -190,7 +193,7 @@ router.get('/', async (req, res) => {
       interpretedQuery: suggestionData.correction || q,
       lyricMatches: lyricResults.length,
       cached: result.cached,
-      searchMode: lyricResults.length ? 'aleon-verified-hybrid+lyrics' : 'aleon-verified-hybrid',
+      searchMode: lyricResults.length ? 'aleon-canonical-first+lyrics' : 'aleon-canonical-first',
       availability: {
         playable: results.length,
         catalog: result.catalogTracks.length,
@@ -199,7 +202,7 @@ router.get('/', async (req, res) => {
       },
     };
     responseCache.set(key, { at: Date.now(), value });
-    console.log(`[ALEON Search] "${q}" playable:${results.length} catalog:${result.catalogTracks.length} AU:${value.availability.audius} SCv:${value.availability.soundcloudVerified}`);
+    console.log(`[ALEON Search] "${q}" catalog:${result.catalogTracks.length} playable:${results.length} AU:${value.availability.audius} SCv:${value.availability.soundcloudVerified} canonical-first`);
     return res.json(value);
   } catch (error) {
     console.error('[ALEON Search]', error);
