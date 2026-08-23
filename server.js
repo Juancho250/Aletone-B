@@ -57,7 +57,9 @@ app.use('/api/auth',            require('./src/routes/auth'));
 app.use('/api/playlists',       require('./src/routes/playlists'));
 app.use('/api/history',         require('./src/routes/history'));
 app.use('/api/recommendations', require('./src/routes/recommendations'));
+app.use('/api/radio',           require('./src/routes/radio'));
 app.use('/api/saved',           require('./src/routes/saved'));
+app.use('/api/search-history',  require('./src/routes/searchHistory'));
 app.use('/api/search',          require('./src/routes/search'));
 app.use('/api/stream',          require('./src/routes/stream'));
 app.use('/api/devices',         require('./src/routes/devices'));
@@ -66,10 +68,11 @@ app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'aletone-api',
-    version: '15',
+    version: '16',
     connect: true,
     tasteGraph: 'v1',
-    search: 'predictive-verified-v1',
+    radio: 'v1',
+    search: 'predictive-verified-v2',
     soundcloudMode: soundCloudMode(),
   });
 });
@@ -85,10 +88,11 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '15',
+    version: '16',
     connect: true,
     tasteGraph: 'v1',
-    search: 'predictive-verified-v1',
+    radio: 'v1',
+    search: 'predictive-verified-v2',
     soundcloud: sc.status === 'fulfilled'
       ? sc.value
       : { ok: false, mode: soundCloudMode(), error: sc.reason?.message },
@@ -110,7 +114,7 @@ initDB()
   .then(() => warmSoundCloud().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`Aletone API v15 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
+      console.log(`Aletone API v16 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
