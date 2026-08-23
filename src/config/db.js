@@ -96,6 +96,17 @@ async function initDB() {
       fetched_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
+    CREATE TABLE IF NOT EXISTS search_history (
+      id          BIGSERIAL PRIMARY KEY,
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      query       TEXT NOT NULL,
+      normalized  TEXT NOT NULL,
+      result_type TEXT NOT NULL DEFAULT 'search',
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(user_id, normalized)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_history_user ON history(user_id);
     CREATE INDEX IF NOT EXISTS idx_history_played ON history(played_at DESC);
     CREATE INDEX IF NOT EXISTS idx_playlist_user ON playlists(user_id);
@@ -104,6 +115,8 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_lyrics_title_artist ON lyrics_cache(LOWER(title), LOWER(artist));
     CREATE INDEX IF NOT EXISTS idx_lyrics_plain_fts
       ON lyrics_cache USING GIN (to_tsvector('simple', COALESCE(plain_lyrics, '')));
+    CREATE INDEX IF NOT EXISTS idx_search_history_user_recent
+      ON search_history(user_id, updated_at DESC);
   `);
   console.log('[DB] Tablas listas');
 }
