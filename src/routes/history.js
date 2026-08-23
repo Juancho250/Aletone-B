@@ -1,6 +1,7 @@
 const router = require('express').Router();
 const { db } = require('../config/db');
 const auth = require('../middleware/auth');
+const { cacheLyrics } = require('../services/lyrics');
 
 router.use(auth);
 
@@ -74,6 +75,16 @@ router.post('/', async (req, res) => {
         String(context_id || '').slice(0, 220) || null,
       ]
     );
+
+    if (String(source || '').toLowerCase() === 'soundcloud' && title && artist) {
+      cacheLyrics({
+        id: String(track_id),
+        title: String(title),
+        artist: String(artist),
+        album: String(album || ''),
+        duration: nonNegativeInt(duration, 0),
+      }).catch(() => {});
+    }
 
     db.query(
       `DELETE FROM history
