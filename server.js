@@ -68,11 +68,11 @@ app.get('/', (_req, res) => {
   res.json({
     status: 'ok',
     service: 'aletone-api',
-    version: '16',
+    version: '17',
     connect: true,
     tasteGraph: 'v1',
     radio: 'v1',
-    search: 'predictive-verified-v2',
+    search: 'instant-progressive-v1',
     soundcloudMode: soundCloudMode(),
   });
 });
@@ -80,6 +80,7 @@ app.get('/', (_req, res) => {
 app.get('/api/health', async (_req, res) => {
   const { db } = require('./src/config/db');
   const { fetchJSON } = require('./src/utils/helpers');
+  const { getStreamResolverStats } = require('./src/services/streamResolver');
   const [sc, dz, dbCheck] = await Promise.allSettled([
     warmSoundCloud(),
     fetchJSON('https://api.deezer.com/search?q=test&limit=1').then(data => ({ ok: true, results: data.data?.length || 0 })),
@@ -88,11 +89,12 @@ app.get('/api/health', async (_req, res) => {
 
   res.json({
     ok: true,
-    version: '16',
+    version: '17',
     connect: true,
     tasteGraph: 'v1',
     radio: 'v1',
-    search: 'predictive-verified-v2',
+    search: 'instant-progressive-v1',
+    streamResolver: getStreamResolverStats(),
     soundcloud: sc.status === 'fulfilled'
       ? sc.value
       : { ok: false, mode: soundCloudMode(), error: sc.reason?.message },
@@ -114,7 +116,7 @@ initDB()
   .then(() => warmSoundCloud().catch(error => console.warn('[SC] Precarga falló:', error.message)))
   .then(() => {
     server = app.listen(PORT, () => {
-      console.log(`Aletone API v16 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
+      console.log(`Aletone API v17 corriendo en puerto ${PORT} · SoundCloud ${soundCloudMode()}`);
     });
     server.keepAliveTimeout = 65_000;
     server.headersTimeout = 66_000;
