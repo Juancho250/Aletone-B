@@ -111,7 +111,7 @@ async function requestJSON(path, params = {}, { timeout = REQUEST_TIMEOUT_MS } =
 function searchExpression(query) {
   const clean = String(query || '').trim().replace(/\s+/g, ' ').slice(0, 160);
   if (!clean) return '';
-  return `${clean} official audio -remix -cover -karaoke -slowed -sped -nightcore`;
+  return `${clean} official -remix -cover -karaoke -slowed -sped -nightcore`;
 }
 
 async function searchVideos(query, limit = 24, { regionCode = DEFAULT_REGION } = {}) {
